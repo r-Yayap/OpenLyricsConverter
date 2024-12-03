@@ -84,10 +84,11 @@ class PDFConverter:
         if lyrics is not None:
             for verse in lyrics:
                 verse_name = verse.attrib.get('name', 'Unnamed')
-                lines = "\n".join([line.strip() for line in verse.itertext() if line.strip()]).replace('<br/>', '\n')
-                lines = lines.replace('\n', '<br/>')
+                lines = "\n".join([line.strip() for line in verse.itertext() if line.strip()]).replace('<br/>',
+                                                                                                       '\n').strip()
+                if not lines:  # Skip if lines are empty
+                    continue
 
-                # Determine standardized name or main verse number
                 if verse_name.startswith('c'):
                     standardized_name = "Chorus"
                 elif verse_name.startswith('b'):
@@ -99,18 +100,16 @@ class PDFConverter:
                 elif verse_name.startswith('v'):
                     verse_number_match = re.match(r'v(\d+)', verse_name, re.IGNORECASE)
                     standardized_name = f"Verse {verse_number_match.group(1)}" if verse_number_match else "Verse"
-                # Updated condition for "Pre-Chorus"
                 elif verse_name.startswith('p') or verse_name.startswith('pa') or verse_name.startswith('pb'):
                     standardized_name = "Pre-Chorus"
                 else:
                     standardized_name = verse_name
 
-                # Group verses by their standardized names
-                if standardized_name not in verses_dict:
-                    verses_dict[
-                        standardized_name] = lines if standardized_name else lines  # No header if standardized_name is None
-                else:
-                    verses_dict[standardized_name] += f"<br/><br/>{lines}"
+                if lines.strip():
+                    if standardized_name not in verses_dict:
+                        verses_dict[standardized_name] = lines
+                    else:
+                        verses_dict[standardized_name] += f"<br/><br/>{lines}"
 
         # Convert verses_dict to list format for consistent output
         verses = [{'name': verse_name, 'lines': verse_lines} for verse_name, verse_lines in verses_dict.items()]
