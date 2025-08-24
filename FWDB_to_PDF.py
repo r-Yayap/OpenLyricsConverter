@@ -3,15 +3,16 @@ from xml.sax.saxutils import escape as html_escape
 from reportlab.lib.pagesizes import A4
 from reportlab.platypus import (
     BaseDocTemplate, Paragraph, Spacer, Frame, PageTemplate,
-    NextPageTemplate, PageBreak
+    NextPageTemplate, PageBreak, Flowable
 )
 from reportlab.platypus.tableofcontents import TableOfContents
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib import colors
+from reportlab.platypus.flowables import CondPageBreak, KeepTogether
+
 import unicodedata
 import os
 import re
-
 
 # ===== Helpers required across the module =====
 
@@ -68,6 +69,25 @@ def findall_by_local(root, tag_name: str):
     return [el for el in root.iter() if isinstance(el.tag, str) and local_name(el.tag) == tag_name]
 
 
+# ===== Layout helper to never start songs in the right column =====
+
+class ForceLeftColumn(Flowable):
+    """
+    If the current frame is the right column, force a page break so that
+    the next content starts at the left column of the next page.
+    Otherwise, do nothing.
+    """
+    def wrap(self, availWidth, availHeight):
+        self._availHeight = availHeight
+        return (0, 0)
+
+    def draw(self):
+        frame = getattr(self.canv, "_frame", None)
+        frame_id = getattr(frame, "id", "")
+        if frame_id == "rightColumn":
+            self.canv.showPage()
+
+
 # ===== Main converter =====
 
 class PDFConverter:
@@ -75,36 +95,75 @@ class PDFConverter:
         self.xml_folder_path = xml_folder_path
         self.output_pdf_path = output_pdf_path
 
-        # Font and spacing configuration
-        self.title_font_size = 14
+        # Font and spacing configuration (default theme)
+        self.title_font_size = 11
         self.title_font_name = 'Helvetica'
         self.title_bold = True
         self.title_italic = False
         self.title_color = colors.darkred
-        self.title_space_before = 16
+        self.title_space_before = 11
         self.title_space_after = 1
 
-        self.author_font_size = 7
+        self.author_font_size = 6
         self.author_font_name = 'Times-Roman'
         self.author_bold = False
         self.author_italic = True
         self.author_color = colors.darkgray
         self.author_space_after = 5
 
-        self.verse_name_font_size = 10
+        self.verse_name_font_size = 9
         self.verse_name_font_name = 'Courier'
         self.verse_name_bold = True
         self.verse_name_italic = False
         self.verse_name_color = colors.darkblue
         self.verse_name_space_after = 1
 
-        self.body_text_font_size = 9
+        self.body_text_font_size = 8
         self.body_text_font_name = 'Helvetica'
         self.body_text_bold = False
         self.body_text_italic = False
         self.body_text_color = colors.black
         self.body_text_space_after = 3
         self.line_spacing = 5  # extra space between verses
+
+    # --- Theme helpers -------------------------------------------------
+
+    def set_theme(self, **kwargs):
+        """
+        Convenience setter for fonts/spacings/colors.
+        Example:
+          converter.set_theme(body_text_font_size=10, title_bold=False, verse_name_font_name='Helvetica')
+        """
+        allowed = {
+            'title_font_size','title_font_name','title_bold','title_italic','title_color',
+            'title_space_before','title_space_after',
+            'author_font_size','author_font_name','author_bold','author_italic','author_color','author_space_after',
+            'verse_name_font_size','verse_name_font_name','verse_name_bold','verse_name_italic','verse_name_color','verse_name_space_after',
+            'body_text_font_size','body_text_font_name','body_text_bold','body_text_italic','body_text_color','body_text_space_after',
+            'line_spacing'
+        }
+        for k, v in kwargs.items():
+            if k in allowed:
+                setattr(self, k, v)
+
+    def scale_fonts(self, factor: float):
+        """
+        Scale all font sizes and vertical spacings at once.
+        E.g., converter.scale_fonts(1.15) for +15%.
+        """
+        self.title_font_size       = round(self.title_font_size       * factor, 2)
+        self.author_font_size      = round(self.author_font_size      * factor, 2)
+        self.verse_name_font_size  = round(self.verse_name_font_size  * factor, 2)
+        self.body_text_font_size   = round(self.body_text_font_size   * factor, 2)
+
+        self.title_space_before    = round(self.title_space_before    * factor, 2)
+        self.title_space_after     = round(self.title_space_after     * factor, 2)
+        self.author_space_after    = round(self.author_space_after    * factor, 2)
+        self.verse_name_space_after= round(self.verse_name_space_after* factor, 2)
+        self.body_text_space_after = round(self.body_text_space_after * factor, 2)
+        self.line_spacing          = round(self.line_spacing          * factor, 2)
+
+    # --- Internal helpers ----------------------------------------------
 
     @staticmethod
     def _safe_anchor(text, used):
@@ -117,11 +176,21 @@ class PDFConverter:
         used.add(name)
         return name
 
+    @staticmethod
+    def measure_block_height(flowables, avail_width):
+        """
+        Sum the wrapped heights of flowables at a known width.
+        We give a huge aH because we only care about each flowable's height.
+        """
+        total = 0
+        for f in flowables:
+            # Many flowables implement wrap; Paragraph/Spacer definitely do.
+            w, h = f.wrap(avail_width, 10 ** 6)
+            total += h
+        return total
+
     # ---------- XML parsing ----------
     def parse_xml(self, xml_file_path):
-        import unicodedata
-        from xml.sax.saxutils import escape as html_escape
-
         print(f"Parsing XML file: {xml_file_path}")
 
         # --- robust file reading (UTF‑8 BOM -> UTF‑16 -> Windows‑1252) ---
@@ -377,44 +446,71 @@ class PDFConverter:
 
         used_anchors = set()
 
-        # Preserve song order; show verse label only at start of a consecutive run
         for song in songs_data:
             if not song:
                 continue
 
-            story.append(Spacer(1, self.title_space_before))
+            # Build the exact flowables that constitute *this* song
+            song_block = []
+
+            # --- spacing before title (kept in the block so it's accounted for) ---
+            song_block.append(Spacer(1, self.title_space_before))
 
             visible_title = song["title"]
             anchor = self._safe_anchor(visible_title, used_anchors)
 
-            # Title paragraph with named anchor — becomes TOC + outline target
+            # Title paragraph (anchor + outline + toc metadata)
             p = Paragraph(f'<a name="{anchor}"/>{html_escape(visible_title)}', title_style)
             p.bookmarkName = anchor
             p.outlineLevel = 0
             p.toc_text = visible_title
-            story.append(p)
+            p.keepWithNext = True
+            song_block.append(p)
 
-            story.append(Spacer(1, self.title_space_after))
+            # gap after title
+            song_block.append(Spacer(1, self.title_space_after))
 
+            # Authors (optional)
             if song['authors']:
                 authors_str = "Authors: " + ", ".join(song['authors'])
-                story.append(Paragraph(html_escape(authors_str), author_style))
-                story.append(Spacer(1, self.author_space_after))
+                ap = Paragraph(html_escape(authors_str), author_style)
+                ap.keepWithNext = True
+                song_block.append(ap)
+                song_block.append(Spacer(1, self.author_space_after))
 
+            # Verses (labels shown only at the start of a label run)
             last_label = None
+            first_body_added = False
             for verse in song['verses']:
                 label = verse['name']  # e.g., "Verse 1", "Chorus", None
 
-                # Show header only if label exists AND starts a new run
                 if label and label != last_label:
-                    story.append(Paragraph(html_escape(label), verse_name_style))
+                    vp = Paragraph(html_escape(label), verse_name_style)
+                    vp.keepWithNext = True
+                    song_block.append(vp)
                     last_label = label
                 elif label != last_label:
-                    last_label = label  # reset if label becomes None or changes
+                    last_label = label
 
-                # Verse body (already HTML with <br/> + chord markup)
-                story.append(Paragraph(verse['lines'], body_text_style))
-                story.append(Spacer(1, self.line_spacing))
+                bp = Paragraph(verse['lines'], body_text_style)
+                if not first_body_added:
+                    bp.keepWithNext = False
+                    first_body_added = True
+
+                song_block.append(bp)
+                song_block.append(Spacer(1, self.line_spacing))
+
+            # === Decide if we need to jump to a fresh page first ===
+            required_h = self.measure_block_height(song_block, content_frame_width)
+
+            # If remaining space < required block height → start new page
+            story.append(CondPageBreak(required_h))
+
+            # Ensure songs never start in right column
+            story.append(ForceLeftColumn())
+
+            # Add the song as a single chunk (kept together if it fits a page)
+            story.append(KeepTogether(song_block))
 
         doc.multiBuild(story)
         print(f"PDF created with table of contents and two columns on content pages: {self.output_pdf_path}")
@@ -464,8 +560,17 @@ class MyDocTemplate(BaseDocTemplate):
 # ----- Run as a script -----
 
 if __name__ == "__main__":
+    # Example usage (you can modify fonts quickly here):
     xml_folder = r"C:\Users\Y\AppData\Roaming\FreeWorship\Data\Songs"
     output_pdf = r"C:\Users\Y\Documents\songs_collection_report.pdf"
 
     converter = PDFConverter(xml_folder, output_pdf)
+
+    # Quick theming examples:
+    # converter.scale_fonts(1.10)  # +10% sizes & spacings
+    # converter.set_theme(
+    #     title_font_name='Helvetica', title_font_size=15, title_bold=True,
+    #     body_text_font_name='Helvetica', body_text_font_size=10
+    # )
+
     converter.convert_all_xml_to_pdf()
