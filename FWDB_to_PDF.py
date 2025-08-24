@@ -7,16 +7,49 @@ from reportlab.platypus import (
 )
 from reportlab.platypus.tableofcontents import TableOfContents
 from reportlab.lib.styles import ParagraphStyle
+from reportlab.lib.enums import TA_RIGHT
 from reportlab.lib import colors
 from reportlab.platypus.flowables import CondPageBreak, KeepTogether
+
+# Unicode TTF registration (for Hebrew + punctuation like U+02BC)
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 
 import unicodedata
 import os
 import re
 
+# Try to register a Unicode font family that includes Hebrew and rich punctuation.
+# Update the paths below to where your TTFs are located.
+try:
+    pdfmetrics.registerFont(TTFont("DejaVuSans",             r"C:\fonts\DejaVuSans.ttf"))
+    pdfmetrics.registerFont(TTFont("DejaVuSans-Bold",        r"C:\fonts\DejaVuSans-Bold.ttf"))
+    pdfmetrics.registerFont(TTFont("DejaVuSans-Oblique",     r"C:\fonts\DejaVuSans-Oblique.ttf"))
+    pdfmetrics.registerFont(TTFont("DejaVuSans-BoldOblique", r"C:\fonts\DejaVuSans-BoldOblique.ttf"))
+except Exception as _e:
+    # If registration fails, we’ll fallback to built-ins (will not render Hebrew properly).
+    print("Warning: Could not register DejaVuSans fonts. Update font paths if you need Hebrew/Unicode glyphs.")
+
+# Optional RTL visual reordering (improves punctuation order for Hebrew)
+try:
+    from bidi.algorithm import get_display  # pip install python-bidi
+except Exception:
+    get_display = None
+
+def rtl_visual(s: str) -> str:
+    """Return visually-correct RTL string if python-bidi is available; else original."""
+    if get_display is None:
+        return s
+    return get_display(s)
+
+HEBREW_RE = re.compile(r'[\u0590-\u05FF]')
+def contains_hebrew(s: str) -> bool:
+    return bool(HEBREW_RE.search(s or ""))
+
+
 # ===== Helpers required across the module =====
 
-# Map common C1 control codes (Windows‑1252 artifacts) to Unicode punctuation
+# Map common C1 control codes (Windows-1252 artifacts) to Unicode punctuation
 C1_TO_UNICODE = {
     0x80: '€', 0x82: '‚', 0x83: 'ƒ', 0x84: '„', 0x85: '…', 0x86: '†', 0x87: '‡',
     0x88: 'ˆ', 0x89: '‰', 0x8A: 'Š', 0x8B: '‹', 0x8C: 'Œ',
@@ -44,7 +77,7 @@ def local_name(tag: str) -> str:
 
 def find_first_by_local(root, *path_candidates):
     """
-    Namespace‑agnostic 'find'. Try several short paths using local names only.
+    Namespace-agnostic 'find'. Try several short paths using local names only.
     Example: 'properties/titles/title' or 'title'
     """
     for cand in path_candidates:
@@ -65,7 +98,7 @@ def find_first_by_local(root, *path_candidates):
     return None
 
 def findall_by_local(root, tag_name: str):
-    """Namespace‑agnostic 'findall' by local name anywhere under root."""
+    """Namespace-agnostic 'findall' by local name anywhere under root."""
     return [el for el in root.iter() if isinstance(el.tag, str) and local_name(el.tag) == tag_name]
 
 
@@ -111,20 +144,20 @@ class PDFConverter:
         self.author_color = colors.darkgray
         self.author_space_after = 5
 
-        self.verse_name_font_size = 9
+        self.verse_name_font_size = 7.5
         self.verse_name_font_name = 'Courier'
         self.verse_name_bold = True
         self.verse_name_italic = False
         self.verse_name_color = colors.darkblue
         self.verse_name_space_after = 1
 
-        self.body_text_font_size = 8
+        self.body_text_font_size = 7
         self.body_text_font_name = 'Helvetica'
         self.body_text_bold = False
         self.body_text_italic = False
         self.body_text_color = colors.black
         self.body_text_space_after = 3
-        self.line_spacing = 5  # extra space between verses
+        self.line_spacing = 4  # extra space between verses
 
     # --- Theme helpers -------------------------------------------------
 
@@ -184,7 +217,6 @@ class PDFConverter:
         """
         total = 0
         for f in flowables:
-            # Many flowables implement wrap; Paragraph/Spacer definitely do.
             w, h = f.wrap(avail_width, 10 ** 6)
             total += h
         return total
@@ -193,7 +225,7 @@ class PDFConverter:
     def parse_xml(self, xml_file_path):
         print(f"Parsing XML file: {xml_file_path}")
 
-        # --- robust file reading (UTF‑8 BOM -> UTF‑16 -> Windows‑1252) ---
+        # --- robust file reading (UTF-8 BOM -> UTF-16 -> Windows-1252) ---
         def read_text_safely(path):
             try:
                 with open(path, 'r', encoding='utf-8-sig') as f:
@@ -220,10 +252,26 @@ class PDFConverter:
 
         # --- helpers ---
         def normalize_text(s: str) -> str:
-            # Clean C1 controls, normalize, fix Cyrillic lookalike E/e
+            # Clean C1 controls, normalize
             s = clean_text(s)
             s = unicodedata.normalize("NFKC", s)
-            s = s.replace("Е", "E").replace("е", "e")  # Cyrillic IE -> Latin
+
+            # Unify various apostrophe-like glyphs to ASCII apostrophe (fixes ■ for U+02BC etc.)
+            APOSTROPHE_MAP = {
+                0x02BC: 0x27,  # MODIFIER LETTER APOSTROPHE ʼ -> '
+                0x2019: 0x27,  # RIGHT SINGLE QUOTATION MARK ’ -> '
+                0x2018: 0x27,  # LEFT SINGLE QUOTATION MARK ‘ -> '
+                0x2032: 0x27,  # PRIME ′ -> '
+                0xFF07: 0x27,  # FULLWIDTH APOSTROPHE ＇ -> '
+            }
+            s = s.translate(APOSTROPHE_MAP)
+
+            # (optional) normalize dashes to ASCII hyphen if needed:
+            # DASH_MAP = {0x2013: 0x2D, 0x2014: 0x2D}  # – — -> -
+            # s = s.translate(DASH_MAP)
+
+            # Fix Cyrillic lookalike E/e (rare but you had this rule)
+            s = s.replace("Е", "E").replace("е", "e")
             return s
 
         def to_raw_without_chords(node) -> str:
@@ -235,33 +283,32 @@ class PDFConverter:
               - <chord .../> is ignored (produces no text)
             """
             out = []
-
             if getattr(node, "text", None):
                 out.append(node.text)
 
             for child in list(node):
                 tag = local_name(child.tag)
-
                 if tag == "br":
                     out.append("\n")
                 elif tag == "chord":
-                    # ignore chords; do not insert spaces
-                    pass
+                    pass  # ignore chords
                 elif tag == "line":
                     out.append(to_raw_without_chords(child))
-                    out.append("\n")  # end of <line> → newline
+                    out.append("\n")
                 else:
                     out.append(to_raw_without_chords(child))
-
                 if getattr(child, "tail", None):
                     out.append(child.tail)
-
             return "".join(out)
 
-        # --- Title (namespace‑agnostic; try common OpenLyrics paths) ---
+        # --- Title (namespace-agnostic; try common OpenLyrics paths) ---
         title_el = find_first_by_local(root, "properties/titles/title", "title")
-        title_text = normalize_text(title_el.text.strip()) if (
-                    title_el is not None and title_el.text) else "Unknown Title"
+        title_text = (title_el.text or "").strip() if (title_el is not None and title_el.text) else "Unknown Title"
+        title_lang = (title_el.attrib.get('lang') or "").lower() if title_el is not None else ""
+        # Normalize + RTL visual if Hebrew
+        title_text = normalize_text(title_text)
+        if title_lang == 'he' or contains_hebrew(title_text):
+            title_text = rtl_visual(title_text)
 
         # --- Authors (prefer properties/authors; fallback to any <author>) ---
         authors_parent = find_first_by_local(root, "properties/authors")
@@ -292,6 +339,7 @@ class PDFConverter:
                     continue
 
                 verse_name_attr = verse_el.attrib.get('name', 'Unnamed')
+                verse_lang = (verse_el.attrib.get('lang') or "").lower()
 
                 # Prefer <lines> containers if present
                 lines_blocks = [child for child in verse_el if local_name(child.tag) == "lines"]
@@ -309,7 +357,13 @@ class PDFConverter:
                 lines = [ln for ln in combined.split("\n") if ln.strip()]
                 if not lines:
                     continue
-                html_text = "<br/>".join(html_escape(normalize_text(ln.strip())) for ln in lines)
+
+                # Normalize text and apply RTL visual reordering for Hebrew
+                norm_lines = [normalize_text(ln.strip()) for ln in lines]
+                if verse_lang == 'he' or any(contains_hebrew(ln) for ln in norm_lines):
+                    norm_lines = [rtl_visual(ln) for ln in norm_lines]
+
+                html_text = "<br/>".join(html_escape(ln) for ln in norm_lines)
 
                 # Map verse name to display label (rendering shows header only at run start)
                 name_l = verse_name_attr.lower()
@@ -321,7 +375,7 @@ class PDFConverter:
                     display_name = "Ending"
                 elif name_l == "ei":
                     display_name = None
-                elif name_l.startswith('p'):  # p, pa, pb
+                elif name_l.startswith('p'):
                     display_name = "Pre-Chorus"
                 elif name_l.startswith('v'):
                     m = re.match(r'v(\d+)', name_l, re.IGNORECASE)
@@ -329,10 +383,11 @@ class PDFConverter:
                 else:
                     display_name = verse_name_attr
 
-                verses.append({'name': display_name, 'lines': html_text})
+                verses.append({'name': display_name, 'lines': html_text, 'lang': verse_lang})
 
         return {
             'title': title_text,
+            'title_lang': title_lang,
             'authors': authors,
             'copyright': copyright_text,
             'released': released_text,
@@ -373,6 +428,13 @@ class PDFConverter:
 
         # Styles (use fontName for bold/italic)
         def pick_font(base, bold=False, italic=False):
+            # Prefer our Unicode family if requested
+            if base.startswith('DejaVuSans') or base.startswith('DejaVu'):
+                if bold and italic: return 'DejaVuSans-BoldOblique'
+                if bold:           return 'DejaVuSans-Bold'
+                if italic:         return 'DejaVuSans-Oblique'
+                return 'DejaVuSans'
+
             if base.startswith('Times'):
                 if bold and italic: return 'Times-BoldItalic'
                 if bold: return 'Times-Bold'
@@ -390,6 +452,10 @@ class PDFConverter:
                 return 'Courier'
             return base
 
+        # Determine if Unicode font actually registered
+        registered = set(pdfmetrics.getRegisteredFontNames())
+        he_font_base = 'DejaVuSans' if 'DejaVuSans' in registered else self.body_text_font_name
+
         title_style = ParagraphStyle(
             name='Title',
             fontSize=self.title_font_size,
@@ -397,6 +463,15 @@ class PDFConverter:
             textColor=self.title_color,
             spaceAfter=self.title_space_after,
             fontName=pick_font(self.title_font_name, self.title_bold, self.title_italic),
+        )
+        title_style_he = ParagraphStyle(
+            name='TitleHE',
+            fontSize=self.title_font_size,
+            leading=self.title_font_size + 2,
+            textColor=self.title_color,
+            spaceAfter=self.title_space_after,
+            fontName=pick_font(he_font_base, self.title_bold, self.title_italic),
+            alignment=TA_RIGHT,
         )
         author_style = ParagraphStyle(
             name='Author',
@@ -421,6 +496,15 @@ class PDFConverter:
             textColor=self.body_text_color,
             spaceAfter=self.body_text_space_after,
             fontName=pick_font(self.body_text_font_name, self.body_text_bold, self.body_text_italic),
+        )
+        body_text_style_he = ParagraphStyle(
+            name='BodyTextHE',
+            fontSize=self.body_text_font_size,
+            leading=self.body_text_font_size + 2,
+            textColor=self.body_text_color,
+            spaceAfter=self.body_text_space_after,
+            fontName=pick_font(he_font_base, self.body_text_font_bold if hasattr(self, 'body_text_font_bold') else False, self.body_text_italic),
+            alignment=TA_RIGHT,
         )
 
         # TOC style: small, clickable (links are wired by afterFlowable)
@@ -457,10 +541,14 @@ class PDFConverter:
             song_block.append(Spacer(1, self.title_space_before))
 
             visible_title = song["title"]
+            title_lang = song.get("title_lang", "")
             anchor = self._safe_anchor(visible_title, used_anchors)
 
+            # Choose LTR/RTL title style
+            title_style_to_use = title_style_he if (title_lang == 'he' or contains_hebrew(visible_title)) else title_style
+
             # Title paragraph (anchor + outline + toc metadata)
-            p = Paragraph(f'<a name="{anchor}"/>{html_escape(visible_title)}', title_style)
+            p = Paragraph(f'<a name="{anchor}"/>{html_escape(visible_title)}', title_style_to_use)
             p.bookmarkName = anchor
             p.outlineLevel = 0
             p.toc_text = visible_title
@@ -492,7 +580,11 @@ class PDFConverter:
                 elif label != last_label:
                     last_label = label
 
-                bp = Paragraph(verse['lines'], body_text_style)
+                # Pick body style based on language
+                vlang = (verse.get('lang') or "").lower()
+                bp_style = body_text_style_he if (vlang == 'he' or contains_hebrew(verse['lines'])) else body_text_style
+
+                bp = Paragraph(verse['lines'], bp_style)
                 if not first_body_added:
                     bp.keepWithNext = False
                     first_body_added = True
@@ -569,8 +661,9 @@ if __name__ == "__main__":
     # Quick theming examples:
     # converter.scale_fonts(1.10)  # +10% sizes & spacings
     # converter.set_theme(
-    #     title_font_name='Helvetica', title_font_size=15, title_bold=True,
-    #     body_text_font_name='Helvetica', body_text_font_size=10
+    #     title_font_name='DejaVuSans', title_font_size=12, title_bold=True,
+    #     body_text_font_name='DejaVuSans', body_text_font_size=9,
+    #     verse_name_font_name='DejaVuSans', author_font_name='DejaVuSans'
     # )
 
     converter.convert_all_xml_to_pdf()
