@@ -7,14 +7,15 @@ from reportlab.platypus import (
 )
 from reportlab.platypus.tableofcontents import TableOfContents
 from reportlab.lib.styles import ParagraphStyle
-from reportlab.lib.enums import TA_RIGHT
+from reportlab.lib.enums import TA_LEFT, TA_RIGHT
 from reportlab.lib import colors
 from reportlab.platypus.flowables import CondPageBreak, KeepTogether
 
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
-from typing import Callable
+from dataclasses import dataclass, field
+from typing import Callable, List, Optional
 import unicodedata
 import os
 import re
@@ -93,9 +94,15 @@ if not UNICODE_FAMILY:
 
 
 # ========= Regex helpers =========
-HEBREW_RE = re.compile(r'[\u0590-\u05FF]')
+RTL_RE = re.compile(r'[\u0590-\u05FF]')
+
+
+def is_rtl_text(s: str) -> bool:
+    return bool(RTL_RE.search(s or ""))
+
+
 def contains_hebrew(s: str) -> bool:
-    return bool(HEBREW_RE.search(s or ""))
+    return is_rtl_text(s)
 
 
 # ===== Helpers required across the module =====
@@ -151,6 +158,91 @@ def findall_by_local(root, tag_name: str):
     return [el for el in root.iter() if isinstance(el.tag, str) and local_name(el.tag) == tag_name]
 
 
+@dataclass
+class ChordMarker:
+    text: str
+    offset: int
+
+
+@dataclass
+class LyricLine:
+    text: str = ""
+    chords: List[ChordMarker] = field(default_factory=list)
+
+    @property
+    def has_chords(self) -> bool:
+        return bool(self.chords)
+
+
+STRUCTURE_NOTATION = {
+    "major": "",
+    "maj": "",
+    "min": "m",
+    "minor": "m",
+    "dom7": "7",
+    "maj7": "maj7",
+    "min7": "m7",
+    "dim": "dim",
+    "aug": "aug",
+    "sus4": "sus4",
+    "sus2": "sus2",
+    "add9": "add9",
+}
+
+
+def format_chord_name(attributes) -> str:
+    old_name = (attributes.get("name") or "").strip()
+    if old_name:
+        return old_name
+
+    root = (attributes.get("root") or "").strip()
+    if not root:
+        return ""
+
+    structure = (attributes.get("structure") or "").strip()
+    suffix = STRUCTURE_NOTATION.get(structure, structure)
+    bass = (attributes.get("bass") or "").strip()
+    chord = f"{root}{suffix}"
+    return f"{chord}/{bass}" if bass else chord
+
+
+def append_text_to_line(line: LyricLine, text: Optional[str]) -> None:
+    if text:
+        line.text += text
+
+
+def parse_lyric_lines(node) -> List[LyricLine]:
+    lines = [LyricLine()]
+
+    def current_line() -> LyricLine:
+        return lines[-1]
+
+    def new_line() -> None:
+        if current_line().text or current_line().chords:
+            lines.append(LyricLine())
+
+    def walk(element) -> None:
+        append_text_to_line(current_line(), getattr(element, "text", None))
+        for child in list(element):
+            tag = local_name(child.tag)
+            if tag == "br":
+                new_line()
+            elif tag == "line":
+                walk(child)
+                new_line()
+            elif tag == "chord":
+                chord_text = format_chord_name(child.attrib)
+                if chord_text:
+                    current_line().chords.append(ChordMarker(chord_text, len(current_line().text)))
+                walk(child)
+            else:
+                walk(child)
+            append_text_to_line(current_line(), getattr(child, "tail", None))
+
+    walk(node)
+    return [line for line in lines if line.text.strip() or line.chords]
+
+
 # ===== Layout helper to never start songs in the right column =====
 class ForceLeftColumn(Flowable):
     """
@@ -158,7 +250,7 @@ class ForceLeftColumn(Flowable):
     the next content starts at the left column of the next page.
     Otherwise, do nothing.
     """
-    def wrap(self, availWidth, availHeight):`
+    def wrap(self, availWidth, availHeight):
         self._availHeight = availHeight
         return (0, 0)
 
@@ -167,6 +259,132 @@ class ForceLeftColumn(Flowable):
         frame_id = getattr(frame, "id", "")
         if frame_id == "rightColumn":
             self.canv.showPage()
+
+
+class ChordLyricsBlock(Flowable):
+    def __init__(
+        self,
+        lines: List[LyricLine],
+        lyric_font: str,
+        lyric_size: float,
+        lyric_color,
+        chord_font: str,
+        chord_size: float,
+        chord_color,
+        space_after: float = 0,
+        alignment: int = TA_LEFT,
+    ):
+        super().__init__()
+        self.lines = lines
+        self.lyric_font = lyric_font
+        self.lyric_size = lyric_size
+        self.lyric_color = lyric_color
+        self.chord_font = chord_font
+        self.chord_size = chord_size
+        self.chord_color = chord_color
+        self.space_after = space_after
+        self.alignment = alignment
+        self._wrapped_width = 0
+        self._line_height = self.lyric_size + self.chord_size + 3
+        self._height = 0
+        self._visual_lines: List[LyricLine] = []
+
+    def wrap(self, availWidth, availHeight):
+        self._wrapped_width = availWidth
+        self._line_height = self.lyric_size + self.chord_size + 3
+        self._visual_lines = []
+        for line in self.lines:
+            self._visual_lines.extend(self._wrap_line(line, availWidth))
+        self._height = len(self._visual_lines) * self._line_height + self.space_after
+        return availWidth, self._height
+
+    def _text_width(self, text: str, font: str, size: float) -> float:
+        return pdfmetrics.stringWidth(text or "", font, size)
+
+    def _x_for_offset(self, line: LyricLine, offset: int) -> float:
+        safe_offset = max(0, min(offset, len(line.text)))
+        return self._text_width(line.text[:safe_offset], self.lyric_font, self.lyric_size)
+
+    def _max_fitting_end(self, text: str, start: int, avail_width: float) -> int:
+        low = start + 1
+        high = len(text)
+        best = low
+        while low <= high:
+            mid = (low + high) // 2
+            if self._text_width(text[start:mid], self.lyric_font, self.lyric_size) <= avail_width:
+                best = mid
+                low = mid + 1
+            else:
+                high = mid - 1
+        return best
+
+    def _wrap_line(self, line: LyricLine, avail_width: float) -> List[LyricLine]:
+        if not line.text:
+            return [line]
+        if self._text_width(line.text, self.lyric_font, self.lyric_size) <= avail_width:
+            return [line]
+
+        wrapped = []
+        text = line.text
+        start = 0
+        while start < len(text):
+            while start < len(text) and text[start] == " ":
+                start += 1
+            if start >= len(text):
+                break
+
+            max_end = self._max_fitting_end(text, start, avail_width)
+            if max_end >= len(text):
+                end = len(text)
+                next_start = end
+            else:
+                break_at = text.rfind(" ", start + 1, max_end + 1)
+                if break_at > start:
+                    end = break_at
+                    next_start = break_at + 1
+                else:
+                    end = max_end
+                    next_start = max_end
+
+            part_text = text[start:end].rstrip()
+            if not part_text:
+                part_text = text[start:next_start] or text[start]
+                end = start + len(part_text)
+                next_start = end
+
+            part_chords = [
+                ChordMarker(chord.text, max(0, min(len(part_text), chord.offset - start)))
+                for chord in line.chords
+                if start <= chord.offset < next_start
+            ]
+            wrapped.append(LyricLine(part_text, part_chords))
+            start = next_start
+
+        return wrapped or [line]
+
+    def draw(self):
+        if not self._visual_lines:
+            self._visual_lines = self.lines
+
+        y = self._height - self._line_height
+        for line in self._visual_lines:
+            chord_y = y + self.lyric_size + 1
+            lyric_y = y
+            lyric_width = self._text_width(line.text, self.lyric_font, self.lyric_size)
+            base_x = max(self._wrapped_width - lyric_width, 0) if self.alignment == TA_RIGHT else 0
+
+            self.canv.setFont(self.chord_font, self.chord_size)
+            self.canv.setFillColor(self.chord_color)
+            for chord in line.chords:
+                chord_width = self._text_width(chord.text, self.chord_font, self.chord_size)
+                max_x = max(self._wrapped_width - chord_width, 0)
+                x = min(base_x + self._x_for_offset(line, chord.offset), max_x)
+                self.canv.drawString(x, chord_y, chord.text)
+
+            self.canv.setFont(self.lyric_font, self.lyric_size)
+            self.canv.setFillColor(self.lyric_color)
+            self.canv.drawString(base_x, lyric_y, line.text)
+            y -= self._line_height
 
 
 # ===== Main converter =====
@@ -180,7 +398,7 @@ class PDFConverter:
         self.title_font_name = 'Helvetica'
         self.title_bold = True
         self.title_italic = False
-        self.title_color = colors.darkred
+        self.title_color = colors.HexColor("#7A1F2B")
         self.title_space_before = 11
         self.title_space_after = 1
 
@@ -195,16 +413,25 @@ class PDFConverter:
         self.verse_name_font_name = 'Courier'
         self.verse_name_bold = True
         self.verse_name_italic = False
-        self.verse_name_color = colors.darkblue
+        self.verse_name_color = colors.HexColor("#355C63")
         self.verse_name_space_after = 1
 
         self.body_text_font_size = 7
         self.body_text_font_name = 'Helvetica'
         self.body_text_bold = False
         self.body_text_italic = False
-        self.body_text_color = colors.black
+        self.body_text_color = colors.HexColor("#202020")
         self.body_text_space_after = 3
         self.line_spacing = 4  # extra space between verses
+
+        self.chord_text_font_size = 5.25
+        self.chord_text_font_name = 'Helvetica'
+        self.chord_text_bold = True
+        self.chord_text_italic = False
+        self.chord_text_color = colors.HexColor("#8A4B2A")
+
+        self.toc_text_color = colors.HexColor("#355C63")
+        self.toc_title_color = colors.HexColor("#2F3A3D")
 
     # --- Theme helpers -------------------------------------------------
     def set_theme(self, **kwargs):
@@ -219,6 +446,8 @@ class PDFConverter:
             'author_font_size','author_font_name','author_bold','author_italic','author_color','author_space_after',
             'verse_name_font_size','verse_name_font_name','verse_name_bold','verse_name_italic','verse_name_color','verse_name_space_after',
             'body_text_font_size','body_text_font_name','body_text_bold','body_text_italic','body_text_color','body_text_space_after',
+            'chord_text_font_size','chord_text_font_name','chord_text_bold','chord_text_italic','chord_text_color',
+            'toc_text_color','toc_title_color',
             'line_spacing'
         }
         for k, v in kwargs.items():
@@ -234,6 +463,7 @@ class PDFConverter:
         self.author_font_size      = round(self.author_font_size      * factor, 2)
         self.verse_name_font_size  = round(self.verse_name_font_size  * factor, 2)
         self.body_text_font_size   = round(self.body_text_font_size   * factor, 2)
+        self.chord_text_font_size  = round(self.chord_text_font_size  * factor, 2)
 
         self.title_space_before    = round(self.title_space_before    * factor, 2)
         self.title_space_after     = round(self.title_space_after     * factor, 2)
@@ -313,32 +543,22 @@ class PDFConverter:
             s = s.replace("Е", "E").replace("е", "e")
             return s
 
-        def to_raw_without_chords(node) -> str:
-            """Traverse node and return text with <br/> and <line> mapped to newlines; ignore <chord>."""
-            out = []
-            if getattr(node, "text", None):
-                out.append(node.text)
-            for child in list(node):
-                tag = local_name(child.tag)
-                if tag == "br":
-                    out.append("\n")
-                elif tag == "chord":
-                    pass
-                elif tag == "line":
-                    out.append(to_raw_without_chords(child))
-                    out.append("\n")
-                else:
-                    out.append(to_raw_without_chords(child))
-                if getattr(child, "tail", None):
-                    out.append(child.tail)
-            return "".join(out)
+        def normalize_lyric_line(line: LyricLine) -> LyricLine:
+            normalized_raw = normalize_text(line.text or "")
+            leading_trim = len(normalized_raw) - len(normalized_raw.lstrip())
+            text = normalized_raw.strip()
+            chords = [
+                ChordMarker(chord.text, max(0, min(len(text), chord.offset - leading_trim)))
+                for chord in line.chords
+            ]
+            return LyricLine(text=text, chords=chords)
 
         # --- Title ---
         title_el = find_first_by_local(root, "properties/titles/title", "title")
         title_text = (title_el.text or "").strip() if (title_el is not None and title_el.text) else "Unknown Title"
         title_lang = (title_el.attrib.get('lang') or "").lower() if title_el is not None else ""
         title_text = normalize_text(title_text)
-        if title_lang == 'he' or contains_hebrew(title_text):
+        if title_lang == 'he' or is_rtl_text(title_text):
             title_text = rtl_visual(title_text)
 
         # --- Authors ---
@@ -375,25 +595,21 @@ class PDFConverter:
                 # Prefer <lines> containers
                 lines_blocks = [child for child in verse_el if local_name(child.tag) == "lines"]
                 if lines_blocks:
-                    parts = [to_raw_without_chords(lb) for lb in lines_blocks]
-                    combined = "\n".join(p for p in parts if p)
+                    parsed_lines = []
+                    for lb in lines_blocks:
+                        parsed_lines.extend(parse_lyric_lines(lb))
                 else:
-                    combined = to_raw_without_chords(verse_el)
+                    parsed_lines = parse_lyric_lines(verse_el)
 
-                # Normalize newlines
-                combined = re.sub(r'\r\n?', '\n', combined)
-                combined = re.sub(r'\n{2,}', '\n', combined)
-
-                # Build HTML for Paragraph: escape & join with <br/>
-                lines = [ln for ln in combined.split("\n") if ln.strip()]
-                if not lines:
+                norm_lines = [normalize_lyric_line(line) for line in parsed_lines]
+                norm_lines = [line for line in norm_lines if line.text or line.chords]
+                if not norm_lines:
                     continue
 
-                norm_lines = [normalize_text(ln.strip()) for ln in lines]
-                if verse_lang == 'he' or any(contains_hebrew(ln) for ln in norm_lines):
-                    norm_lines = [rtl_visual(ln) for ln in norm_lines]
+                if verse_lang == 'he' or any(is_rtl_text(line.text) for line in norm_lines):
+                    norm_lines = [LyricLine(rtl_visual(line.text), line.chords) for line in norm_lines]
 
-                html_text = "<br/>".join(html_escape(ln) for ln in norm_lines)
+                html_text = "<br/>".join(html_escape(line.text) for line in norm_lines)
 
                 # Display label mapping
                 name_l = verse_name_attr.lower()
@@ -413,7 +629,7 @@ class PDFConverter:
                 else:
                     display_name = verse_name_attr
 
-                verses.append({'name': display_name, 'lines': html_text, 'lang': verse_lang})
+                verses.append({'name': display_name, 'lines': html_text, 'lyric_lines': norm_lines, 'lang': verse_lang})
 
         return {
             'title': title_text,
@@ -552,13 +768,13 @@ class PDFConverter:
                 leftIndent=16,
                 firstLineIndent=-16,
                 leading=7,
-                textColor=colors.blue,
+                textColor=self.toc_text_color,
                 spaceBefore=0,
                 spaceAfter=0,
                 fontName=pick_font(he_font_base, False, False),
             )
         ]
-        toc.linkColor = colors.blue
+        toc.linkColor = self.toc_text_color
         try:
             toc.dotsMinLevel = 0  # show dot leaders if supported by your ReportLab version
         except Exception:
@@ -566,7 +782,8 @@ class PDFConverter:
 
         story = []
         story.append(Paragraph("Table of Contents", ParagraphStyle(name="TOCTitle", fontSize=12, spaceAfter=6,
-                                                                  fontName=pick_font(he_font_base))))
+                                                                  fontName=pick_font(he_font_base),
+                                                                  textColor=self.toc_title_color)))
         story.append(toc)
         story.append(NextPageTemplate('TwoCol'))
         story.append(PageBreak())
@@ -625,9 +842,29 @@ class PDFConverter:
 
                 # Pick body style based on language
                 vlang = (verse.get('lang') or "").lower()
-                bp_style = body_text_style_he if (vlang == 'he' or contains_hebrew(verse['lines'])) else body_text_style
+                lyric_lines = verse.get('lyric_lines') or []
+                is_rtl_verse = (
+                    vlang == 'he'
+                    or any(is_rtl_text(line.text) for line in lyric_lines)
+                    or is_rtl_text(verse['lines'])
+                )
+                bp_style = body_text_style_he if is_rtl_verse else body_text_style
 
-                bp = Paragraph(verse['lines'], bp_style)
+                fallback_text = verse['lines'].replace("<br/>", "\n")
+                lines_for_block = lyric_lines or [
+                    LyricLine(text=line) for line in fallback_text.split("\n") if line
+                ]
+                bp = ChordLyricsBlock(
+                    lines_for_block,
+                    lyric_font=bp_style.fontName,
+                    lyric_size=bp_style.fontSize,
+                    lyric_color=bp_style.textColor,
+                    chord_font=pick_font(self.chord_text_font_name, self.chord_text_bold, self.chord_text_italic),
+                    chord_size=self.chord_text_font_size,
+                    chord_color=self.chord_text_color,
+                    space_after=self.body_text_space_after,
+                    alignment=getattr(bp_style, "alignment", TA_LEFT),
+                )
                 if not first_body_added:
                     bp.keepWithNext = False
                     first_body_added = True
@@ -694,7 +931,8 @@ if __name__ == "__main__":
             title_font_name=UNICODE_FAMILY,
             author_font_name=UNICODE_FAMILY,
             verse_name_font_name=UNICODE_FAMILY,
-            body_text_font_name=UNICODE_FAMILY
+            body_text_font_name=UNICODE_FAMILY,
+            chord_text_font_name=UNICODE_FAMILY
         )
 
     # Example tweaks (uncomment to try):
