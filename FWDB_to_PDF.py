@@ -14,11 +14,22 @@ from reportlab.platypus.flowables import CondPageBreak, KeepTogether
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional
 import unicodedata
 import os
 import re
+import time
+
+
+def startup_logs_enabled() -> bool:
+    return os.environ.get("FWDB_TO_PDF_QUIET_STARTUP") != "1"
+
+
+def startup_log(message: str):
+    if startup_logs_enabled():
+        print(message)
 
 
 # ========= Optional RTL visual reordering =========
@@ -83,14 +94,14 @@ for name, reg, bold, ital, boldital in CANDIDATES:
             continue
         _register_font_family(name, reg, bold, ital, boldital)
         UNICODE_FAMILY = name
-        print(f"Using Unicode font family: {UNICODE_FAMILY}")
+        startup_log(f"Using Unicode font family: {UNICODE_FAMILY}")
         break
     except Exception:
         continue
 
 if not UNICODE_FAMILY:
-    print("WARNING: No Unicode TTF family registered. Hebrew will render as squares. "
-          "Install Noto Sans Hebrew or DejaVu Sans and update paths.")
+    startup_log("WARNING: No Unicode TTF family registered. Hebrew will render as squares. "
+                "Install Noto Sans Hebrew or DejaVu Sans and update paths.")
 
 
 # ========= Regex helpers =========
@@ -243,6 +254,71 @@ def parse_lyric_lines(node) -> List[LyricLine]:
     return [line for line in lines if line.text.strip() or line.chords]
 
 
+def lyric_line_to_plain_data(line: LyricLine) -> dict:
+    return {
+        "text": line.text,
+        "chords": [{"text": chord.text, "offset": chord.offset} for chord in line.chords],
+    }
+
+
+def lyric_line_from_plain_data(data: dict) -> LyricLine:
+    return LyricLine(
+        text=data.get("text", ""),
+        chords=[
+            ChordMarker(chord.get("text", ""), int(chord.get("offset", 0)))
+            for chord in data.get("chords", [])
+        ],
+    )
+
+
+def song_to_plain_data(song):
+    if not song:
+        return None
+
+    plain_song = dict(song)
+    plain_verses = []
+    for verse in song.get("verses", []):
+        plain_verse = dict(verse)
+        plain_verse["lyric_lines"] = [
+            lyric_line_to_plain_data(line)
+            for line in verse.get("lyric_lines", [])
+        ]
+        plain_verses.append(plain_verse)
+    plain_song["verses"] = plain_verses
+    return plain_song
+
+
+def song_from_plain_data(song):
+    if not song:
+        return None
+
+    restored_song = dict(song)
+    restored_verses = []
+    for verse in song.get("verses", []):
+        restored_verse = dict(verse)
+        restored_verse["lyric_lines"] = [
+            lyric_line_from_plain_data(line)
+            for line in verse.get("lyric_lines", [])
+        ]
+        restored_verses.append(restored_verse)
+    restored_song["verses"] = restored_verses
+    return restored_song
+
+
+def parse_song_file_worker(task):
+    index, file_path = task
+    converter = PDFConverter(
+        os.path.dirname(file_path),
+        "",
+        parse_workers=1,
+        parallel_parsing=False,
+        show_progress=False,
+        quiet=True,
+    )
+    song = converter.parse_xml(file_path)
+    return index, os.path.basename(file_path), song_to_plain_data(song)
+
+
 # ===== Layout helper to never start songs in the right column =====
 class ForceLeftColumn(Flowable):
     """
@@ -389,9 +465,23 @@ class ChordLyricsBlock(Flowable):
 
 # ===== Main converter =====
 class PDFConverter:
-    def __init__(self, xml_folder_path, output_pdf_path):
+    def __init__(
+        self,
+        xml_folder_path,
+        output_pdf_path,
+        parse_workers=None,
+        parallel_parsing=True,
+        show_progress=True,
+        parallel_parse_threshold=8,
+        quiet=False,
+    ):
         self.xml_folder_path = xml_folder_path
         self.output_pdf_path = output_pdf_path
+        self.parse_workers = parse_workers
+        self.parallel_parsing = parallel_parsing
+        self.show_progress = show_progress
+        self.parallel_parse_threshold = parallel_parse_threshold
+        self.quiet = quiet
 
         # Font and spacing configuration (default theme)
         self.title_font_size = 11
@@ -432,6 +522,41 @@ class PDFConverter:
 
         self.toc_text_color = colors.HexColor("#355C63")
         self.toc_title_color = colors.HexColor("#2F3A3D")
+
+    def _log(self, message: str):
+        if not self.quiet:
+            print(message)
+
+    def _progress(self, label: str, completed: int, total: int, detail: str = ""):
+        if self.quiet or not self.show_progress:
+            return
+
+        percent = int((completed / total) * 100) if total else 100
+        suffix = f" - {detail}" if detail else ""
+        print(f"{label}: {completed}/{total} ({percent:3d}%){suffix}")
+
+    def _discover_xml_files(self):
+        return [
+            os.path.join(self.xml_folder_path, file_name)
+            for file_name in sorted(os.listdir(self.xml_folder_path), key=str.lower)
+            if file_name.lower().endswith('.xml')
+        ]
+
+    def _effective_parse_workers(self, file_count: int) -> int:
+        if file_count <= 0:
+            return 1
+
+        requested = self.parse_workers
+        if requested is None:
+            requested = os.cpu_count() or 1
+        return max(1, min(int(requested), file_count))
+
+    def _should_parse_in_parallel(self, file_count: int) -> bool:
+        return (
+            self.parallel_parsing
+            and file_count >= self.parallel_parse_threshold
+            and self._effective_parse_workers(file_count) > 1
+        )
 
     # --- Theme helpers -------------------------------------------------
     def set_theme(self, **kwargs):
@@ -495,7 +620,8 @@ class PDFConverter:
 
     # ---------- XML parsing ----------
     def parse_xml(self, xml_file_path):
-        print(f"Parsing XML file: {xml_file_path}")
+        if not self.show_progress:
+            self._log(f"Parsing XML file: {xml_file_path}")
 
         # --- robust file reading (UTF-8 BOM -> UTF-16 -> Windows-1252) ---
         def read_text_safely(path):
@@ -642,6 +768,7 @@ class PDFConverter:
 
     # ---------- PDF building ----------
     def create_pdf(self, songs_data):
+        build_start = time.perf_counter()
         doc = MyDocTemplate(self.output_pdf_path, pagesize=A4, title="Songs Collection")
 
         # Page geometry
@@ -790,9 +917,11 @@ class PDFConverter:
 
         used_anchors = set()
 
-        for song in songs_data:
-            if not song:
-                continue
+        valid_songs = [song for song in songs_data if song]
+        total_songs = len(valid_songs)
+
+        for song_index, song in enumerate(valid_songs, start=1):
+            self._progress("Building PDF story", song_index, total_songs, song.get("title", "Untitled"))
 
             # Build the exact flowables that constitute *this* song
             song_block = []
@@ -878,19 +1007,80 @@ class PDFConverter:
             story.append(ForceLeftColumn())          # and never start a song in the right column
             story.append(KeepTogether(song_block))   # keep block together if it fits a fresh page
 
+        self._log("Rendering PDF layout with ReportLab...")
         doc.multiBuild(story)
-        print(f"PDF created with table of contents and two columns on content pages: {self.output_pdf_path}")
+        elapsed = time.perf_counter() - build_start
+        self._log(f"PDF created with table of contents and two columns on content pages: {self.output_pdf_path}")
+        self._log(f"PDF build completed in {elapsed:.1f}s.")
 
     def convert_all_xml_to_pdf(self):
-        songs_data = []
-        for file_name in sorted(os.listdir(self.xml_folder_path), key=str.lower):
-            if file_name.lower().endswith('.xml'):
-                file_path = os.path.join(self.xml_folder_path, file_name)
-                print(f"Processing file: {file_name}")
-                song_data = self.parse_xml(file_path)
-                if song_data:
-                    songs_data.append(song_data)
+        start = time.perf_counter()
+        xml_files = self._discover_xml_files()
+        total_files = len(xml_files)
+        self._log(f"Found {total_files} XML song files.")
+
+        if self._should_parse_in_parallel(total_files):
+            try:
+                songs_data = self._parse_files_parallel(xml_files)
+            except Exception as exc:
+                self._log(f"Parallel XML parsing failed ({exc}). Falling back to sequential parsing.")
+                songs_data = self._parse_files_sequential(xml_files)
+        else:
+            songs_data = self._parse_files_sequential(xml_files)
+
+        elapsed = time.perf_counter() - start
+        self._log(f"Parsed {len(songs_data)}/{total_files} songs in {elapsed:.1f}s.")
         self.create_pdf(songs_data)
+
+    def _parse_files_sequential(self, xml_files):
+        songs_data = []
+        total_files = len(xml_files)
+        for index, file_path in enumerate(xml_files, start=1):
+            file_name = os.path.basename(file_path)
+            self._progress("Parsing XML", index, total_files, file_name)
+            song_data = self.parse_xml(file_path)
+            if song_data:
+                songs_data.append(song_data)
+        return songs_data
+
+    def _parse_files_parallel(self, xml_files):
+        total_files = len(xml_files)
+        workers = self._effective_parse_workers(total_files)
+        self._log(f"Parsing XML with {workers} worker processes...")
+
+        songs_by_index = [None] * total_files
+        failed_futures = 0
+        previous_quiet_startup = os.environ.get("FWDB_TO_PDF_QUIET_STARTUP")
+        os.environ["FWDB_TO_PDF_QUIET_STARTUP"] = "1"
+        try:
+            with ProcessPoolExecutor(max_workers=workers) as executor:
+                future_to_file = {
+                    executor.submit(parse_song_file_worker, (index, file_path)): os.path.basename(file_path)
+                    for index, file_path in enumerate(xml_files)
+                }
+                for completed, future in enumerate(as_completed(future_to_file), start=1):
+                    file_name = future_to_file[future]
+                    try:
+                        index, parsed_file_name, plain_song = future.result()
+                    except Exception as exc:
+                        failed_futures += 1
+                        self._log(f"Failed to parse {file_name}: {exc}")
+                        self._progress("Parsing XML", completed, total_files, file_name)
+                        continue
+
+                    self._progress("Parsing XML", completed, total_files, parsed_file_name)
+                    if plain_song:
+                        songs_by_index[index] = song_from_plain_data(plain_song)
+        finally:
+            if previous_quiet_startup is None:
+                os.environ.pop("FWDB_TO_PDF_QUIET_STARTUP", None)
+            else:
+                os.environ["FWDB_TO_PDF_QUIET_STARTUP"] = previous_quiet_startup
+
+        if total_files and failed_futures == total_files:
+            raise RuntimeError("all parallel XML parser workers failed")
+
+        return [song for song in songs_by_index if song]
 
 
 # ----- Document template with clickable TOC support -----
