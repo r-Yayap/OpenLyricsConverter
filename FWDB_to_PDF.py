@@ -1111,7 +1111,7 @@ class MyDocTemplate(BaseDocTemplate):
 # ----- Run as a script -----
 if __name__ == "__main__":
     xml_folder = r"C:\Users\Y\AppData\Roaming\FreeWorship\Data\Songs"
-    output_pdf = r"C:\Users\Y\Documents\songs_collection_report.pdf"
+    output_pdf = r"C:\Users\Y\Documents\Songbook-v260613-0.pdf"
 
     converter = PDFConverter(xml_folder, output_pdf)
 
