@@ -514,10 +514,10 @@ class PDFConverter:
         self.body_text_space_after = 3
         self.line_spacing = 4  # extra space between verses
 
-        self.chord_text_font_size = 5.25
+        self.chord_text_font_size = 4.0
         self.chord_text_font_name = 'Helvetica'
         self.chord_text_bold = True
-        self.chord_text_italic = False
+        self.chord_text_italic = True
         self.chord_text_color = colors.HexColor("#8A4B2A")
 
         self.toc_text_color = colors.HexColor("#355C63")
@@ -1082,6 +1082,258 @@ class PDFConverter:
 
         return [song for song in songs_by_index if song]
 
+    # ---------- OpenLyrics -> OpenSong export ----------
+    @staticmethod
+    def _safe_filename(name: str) -> str:
+        name = name or "Untitled"
+
+        # Replace Windows-invalid characters
+        name = re.sub(r'[<>:"/\\|?*\x00-\x1F]+', "_", name)
+
+        # Replace dots inside the song title so Android/Windows does not confuse extensions
+        name = name.replace(".", " ")
+
+        # Clean repeated spaces
+        name = re.sub(r"\s+", " ", name).strip()
+
+        # Avoid trailing spaces/dots, which Windows hates
+        name = name.rstrip(" .")
+
+        return name[:120] or "Untitled"
+
+    @staticmethod
+    def _opensong_section_label(display_name: Optional[str]) -> Optional[str]:
+        """
+        Convert your parsed display labels into OpenSong section labels.
+        OpenSong understands labels like [V1], [C], [B], [P], [T].
+        """
+        if not display_name:
+            return None
+
+        name = display_name.strip().lower()
+
+        if name.startswith("verse"):
+            m = re.search(r"\d+", name)
+            return f"V{m.group(0)}" if m else "V"
+
+        if name.startswith("chorus"):
+            return "C"
+
+        if name.startswith("bridge"):
+            return "B"
+
+        if name.startswith("pre-chorus") or name.startswith("prechorus"):
+            return "P"
+
+        if name.startswith("ending") or name.startswith("tag"):
+            return "T"
+
+        # fallback: keep first safe word/letter
+        cleaned = re.sub(r"[^A-Za-z0-9]+", "", display_name)
+        return cleaned or None
+
+    @staticmethod
+    def _opensong_chord_line(line: LyricLine) -> str:
+        """
+        Convert chord offsets into an OpenSong chord line.
+
+        OpenSong chord line starts with "."
+        Lyric line starts with " "
+        So chord offset 0 should be placed at index 1.
+        """
+        lyric_text = line.text or ""
+        chord_line = ["."] + [" "] * max(len(lyric_text), 1)
+
+        for chord in sorted(line.chords, key=lambda c: c.offset):
+            chord_text = chord.text.strip()
+            if not chord_text:
+                continue
+
+            pos = max(1, int(chord.offset) + 1)
+
+            while len(chord_line) < pos + len(chord_text):
+                chord_line.append(" ")
+
+            # Avoid overwriting another chord if two chords are too close.
+            while any(
+                i < len(chord_line) and chord_line[i] not in (" ", ".")
+                for i in range(pos, pos + len(chord_text))
+            ):
+                pos += 1
+                while len(chord_line) < pos + len(chord_text):
+                    chord_line.append(" ")
+
+            for i, ch in enumerate(chord_text):
+                chord_line[pos + i] = ch
+
+        return "".join(chord_line).rstrip()
+
+    def _song_to_opensong_lyrics(self, song: dict) -> tuple[str, str]:
+        rows = []
+        presentation_parts = []
+        last_label = None
+
+        for verse in song.get("verses", []):
+            label = self._opensong_section_label(verse.get("name"))
+
+            # Only create a new OpenSong section if the label changed.
+            # This prevents [C] [C] [V1] [V1] duplication.
+            if label and label != last_label:
+                if rows and rows[-1] != "":
+                    rows.append("")
+                rows.append(f"[{label}]")
+                presentation_parts.append(label)
+                last_label = label
+
+            lyric_lines = verse.get("lyric_lines") or []
+            fallback_lines = (verse.get("lines") or "").replace("<br/>", "\n").splitlines()
+
+            if lyric_lines:
+                for line in lyric_lines:
+                    if line.chords:
+                        rows.append(self._opensong_chord_line(line))
+
+                    # OpenSong lyric lines should begin with at least one space.
+                    text = (line.text or "").rstrip()
+                    if text:
+                        rows.append(" " + text)
+            else:
+                for text in fallback_lines:
+                    text = text.strip()
+                    if text:
+                        rows.append(" " + text)
+
+        lyrics_text = "\n".join(rows).rstrip()
+        presentation = " ".join(presentation_parts)
+
+        return lyrics_text, presentation
+
+    def _song_to_opensong_xml_root(self, song: dict):
+        from datetime import datetime, timezone
+        import uuid
+
+        lyrics_text, presentation = self._song_to_opensong_lyrics(song)
+
+        root = ET.Element("song")
+
+        def add(tag: str, value: str = "", attrib: dict | None = None):
+            el = ET.SubElement(root, tag, attrib or {})
+            el.text = value or ""
+            return el
+
+        last_modified = (
+            datetime.now(timezone.utc)
+            .isoformat(timespec="milliseconds")
+            .replace("+00:00", "Z")
+        )
+
+        add("uuid", str(uuid.uuid4()))
+        add("last_modified", last_modified)
+
+        add("title", song.get("title", "Unknown Title"))
+        add("author", ", ".join(song.get("authors") or []))
+
+        copyright_text = song.get("copyright", "")
+        if copyright_text == "Unknown Copyright":
+            copyright_text = ""
+        add("copyright", copyright_text)
+
+        add("presentation", presentation)
+        add("hymn_number", "")
+        add("capo", "", {"print": ""})
+        add("tempo", "")
+        add("time_sig", "")
+        add("duration", "")
+        add("predelay", "")
+        add("ccli", "")
+        add("theme", "")
+        add("alttheme", "")
+        add("user1", "Converted from OpenLyrics")
+        add("user2", "")
+        add("user3", "")
+
+        # OpenSongApp-specific fields seen in files created by the app
+        add("beatbuddysong", "")
+        add("beatbuddykit", "")
+        add("drummer", "")
+        add("drummerkit", "")
+
+        add("key", "")
+        add("keyoriginal", "")
+        add("aka", "")
+        add("midi", "")
+        add("midi_index", "")
+        add("notes", "")
+
+        add("lyrics", lyrics_text)
+
+        add("pad_file", "")
+        add("custom_chords", "")
+        add("link_youtube", "")
+        add("link_web", "")
+        add("link_audio", "")
+        add("loop_audio", "")
+        add("link_other", "")
+        add("abcnotation", "")
+        add("abctranspose", "0")
+
+        return root
+
+    def export_all_xml_to_opensong(self, output_folder: str, extension: str = ".ost"):
+        """
+        Convert all OpenLyrics XML files in self.xml_folder_path
+        into OpenSong-compatible song files.
+
+        Use extension=".ost" for OpenSongApp Android.
+        Use extension=".xml" if you really want XML extension.
+        """
+        os.makedirs(output_folder, exist_ok=True)
+
+        xml_files = self._discover_xml_files()
+        total_files = len(xml_files)
+
+        self._log(f"Found {total_files} OpenLyrics XML files.")
+        self._log(f"Exporting OpenSong files to: {output_folder}")
+
+        used_names = {}
+
+        for index, file_path in enumerate(xml_files, start=1):
+            file_name = os.path.basename(file_path)
+            self._progress("Converting to OpenSong", index, total_files, file_name)
+
+            song = self.parse_xml(file_path)
+            if not song:
+                continue
+
+            title = song.get("title") or os.path.splitext(file_name)[0]
+            safe_base = self._safe_filename(title)
+
+            count = used_names.get(safe_base, 0) + 1
+            used_names[safe_base] = count
+
+            if count > 1:
+                safe_base = f"{safe_base}_{count}"
+
+            output_path = os.path.join(output_folder, safe_base + extension)
+
+            root = self._song_to_opensong_xml_root(song)
+            tree = ET.ElementTree(root)
+
+            try:
+                ET.indent(tree, space="  ", level=0)  # Python 3.9+
+            except Exception:
+                pass
+
+            tree.write(
+                output_path,
+                encoding="utf-8",
+                xml_declaration=True,
+                short_empty_elements=False,
+            )
+
+        self._log("OpenSong export completed.")
+
+
 
 # ----- Document template with clickable TOC support -----
 class MyDocTemplate(BaseDocTemplate):
@@ -1112,10 +1364,18 @@ class MyDocTemplate(BaseDocTemplate):
 if __name__ == "__main__":
     xml_folder = r"C:\Users\Y\AppData\Roaming\FreeWorship\Data\Songs"
     output_pdf = r"C:\Users\Y\Documents\Songbook-v260613-0.pdf"
+    opensong_output_folder = r"C:\Users\Y\Documents\OpenSong-Export"
+
+    # Choose one:
+    # "opensong" = export OpenLyrics XML to OpenSong .ost only
+    # "pdf"      = generate PDF only
+    # "both"     = export OpenSong and generate PDF
+    RUN_MODE = "opensong"
 
     converter = PDFConverter(xml_folder, output_pdf)
 
-    # If a Unicode family was registered, force all styles to use it by default
+    # Apply PDF theme/settings before any PDF generation.
+    # This does not really affect OpenSong export, but it is safe here.
     if UNICODE_FAMILY:
         converter.set_theme(
             title_font_name=UNICODE_FAMILY,
@@ -1125,8 +1385,29 @@ if __name__ == "__main__":
             chord_text_font_name=UNICODE_FAMILY
         )
 
-    # Example tweaks (uncomment to try):
-    # converter.scale_fonts(1.10)  # +10% sizes & spacings
-    # converter.set_theme(title_font_size=12, body_text_font_size=8.5)
+    # Optional PDF style tweaks
+    converter.set_theme(
+        chord_text_font_size=4.5,
+        chord_text_italic=True
+    )
 
-    converter.convert_all_xml_to_pdf()
+    if RUN_MODE == "opensong":
+        converter.export_all_xml_to_opensong(
+            opensong_output_folder,
+            extension=""
+        )
+
+    elif RUN_MODE == "pdf":
+        converter.convert_all_xml_to_pdf()
+
+    elif RUN_MODE == "both":
+        converter.export_all_xml_to_opensong(
+            opensong_output_folder,
+            extension=".ost"
+        )
+        converter.convert_all_xml_to_pdf()
+
+    else:
+        raise ValueError(
+            'Invalid RUN_MODE. Use "opensong", "pdf", or "both".'
+        )
