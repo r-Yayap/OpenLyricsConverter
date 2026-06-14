@@ -75,8 +75,8 @@ def read_csv_rows(path: Path) -> List[Dict[str, str]]:
 
 def read_text(path: Path) -> str:
     try:
-        return path.read_text(encoding="utf-8")
-    except OSError:
+        return builder.safe_read_text(path)
+    except (OSError, UnicodeError):
         return ""
 
 
@@ -122,13 +122,50 @@ def _details_for_title(rows: List[Dict[str, str]], title: str) -> List[Dict[str,
     ]
 
 
-def load_review_candidates(out_dir: Path) -> List[ReviewCandidate]:
+def read_detail_rows_for_title(path: Path, title: str) -> List[Dict[str, str]]:
+    if not title:
+        return []
+    rows: List[Dict[str, str]] = []
+    try:
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            for row in csv.DictReader(handle):
+                if (
+                    row.get("a_title") == title
+                    or row.get("b_title") == title
+                    or row.get("title") == title
+                    or row.get("canonical_title") == title
+                ):
+                    rows.append(row)
+    except OSError:
+        return []
+    return rows
+
+
+def load_candidate_details(out_dir: Path, candidate: ReviewCandidate) -> ReviewCandidate:
+    out_dir = Path(out_dir)
+    reports_dir = out_dir / "reports"
+    source_path = resolve_report_path(out_dir, candidate.source_path)
+    candidate.export_text = read_text(candidate.export_path)
+    candidate.source_text = read_text(source_path) if source_path.exists() else ""
+    candidate.pair_details = read_detail_rows_for_title(reports_dir / "07_group_pair_scores.csv", candidate.title)
+    candidate.conflict_details = read_detail_rows_for_title(
+        reports_dir / "08_same_title_different_lyrics.csv",
+        candidate.title,
+    )
+    return candidate
+
+
+def load_review_candidates(
+    out_dir: Path,
+    include_text: bool = True,
+    include_details: bool = True,
+) -> List[ReviewCandidate]:
     out_dir = Path(out_dir)
     reports_dir = out_dir / "reports"
     canonical_rows = read_csv_rows(reports_dir / "03_canonical_selection.csv")
     group_rows = {row.get("group_id", ""): row for row in read_csv_rows(reports_dir / "02_match_groups.csv")}
-    pair_rows = read_csv_rows(reports_dir / "07_group_pair_scores.csv")
-    conflict_rows = read_csv_rows(reports_dir / "08_same_title_different_lyrics.csv")
+    pair_rows = read_csv_rows(reports_dir / "07_group_pair_scores.csv") if include_details else []
+    conflict_rows = read_csv_rows(reports_dir / "08_same_title_different_lyrics.csv") if include_details else []
     decisions = load_decision_map(out_dir)
     candidates: List[ReviewCandidate] = []
 
@@ -157,10 +194,10 @@ def load_review_candidates(out_dir: Path) -> List[ReviewCandidate]:
                 canonical_reason=row.get("canonical_reason", ""),
                 members=group.get("members", ""),
                 best_lyric_identity_score=group.get("best_lyric_identity_score", ""),
-                pair_details=_details_for_title(pair_rows, title),
-                conflict_details=_details_for_title(conflict_rows, title),
-                export_text=read_text(export_path),
-                source_text=read_text(source_path) if source_path.exists() else "",
+                pair_details=_details_for_title(pair_rows, title) if include_details else [],
+                conflict_details=_details_for_title(conflict_rows, title) if include_details else [],
+                export_text=read_text(export_path) if include_text else "",
+                source_text=read_text(source_path) if include_text and source_path.exists() else "",
                 status=status,
             )
         )
@@ -184,7 +221,7 @@ def load_review_candidates(out_dir: Path) -> List[ReviewCandidate]:
                     source_path="",
                     file_hash="",
                     canonical_reason="Found in review folder without report row",
-                    export_text=read_text(export_path),
+                    export_text=read_text(export_path) if include_text else "",
                     source_text="",
                 )
             )

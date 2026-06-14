@@ -136,7 +136,19 @@ class ReviewResolverWindow(tk.Toplevel):
         ttk.Label(root, textvariable=self.status_var).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
 
     def refresh(self) -> None:
-        self.candidates = review.load_review_candidates(self.output_dir)
+        self.status_var.set("Loading review items...")
+        self.update_idletasks()
+        try:
+            self.candidates = review.load_review_candidates(
+                self.output_dir,
+                include_text=False,
+                include_details=False,
+            )
+        except Exception as exc:
+            self.candidates = []
+            self.status_var.set(f"Could not load review items: {exc}")
+            messagebox.showerror("Could not load review items", str(exc), parent=self)
+            return
         self.candidate_by_item.clear()
         for item in self.tree.get_children():
             self.tree.delete(item)
@@ -155,7 +167,10 @@ class ReviewResolverWindow(tk.Toplevel):
                 ),
             )
             self.candidate_by_item[item] = candidate
-        self.status_var.set(f"Loaded {len(self.candidates)} review item(s).")
+        if self.candidates:
+            self.status_var.set(f"Loaded {len(self.candidates)} review item(s).")
+        else:
+            self.status_var.set("No review items found in the selected output folder.")
 
     def selected_candidate(self) -> Optional[review.ReviewCandidate]:
         selected = self.tree.selection()
@@ -167,6 +182,15 @@ class ReviewResolverWindow(tk.Toplevel):
         candidate = self.selected_candidate()
         if not candidate:
             return
+        if not candidate.export_text and candidate.export_path.exists():
+            self.status_var.set(f"Loading {candidate.title}...")
+            self.update_idletasks()
+            try:
+                candidate = review.load_candidate_details(self.output_dir, candidate)
+            except Exception as exc:
+                self.status_var.set(f"Could not load item details: {exc}")
+                messagebox.showerror("Could not load item details", str(exc), parent=self)
+                return
         self.summary.configure(state="normal")
         self.summary.delete("1.0", "end")
         self.summary.insert(
@@ -225,13 +249,20 @@ class ReviewResolverWindow(tk.Toplevel):
 
     def open_selected_file(self) -> None:
         candidate = self.selected_candidate()
-        if candidate and candidate.export_path.exists():
-            open_path(candidate.export_path)
+        if not candidate:
+            messagebox.showinfo("No item selected", "Select a review item first.", parent=self)
+            return
+        if not candidate.export_path.exists():
+            messagebox.showinfo("File not found", f"Could not find:\n{candidate.export_path}", parent=self)
+            return
+        open_path(candidate.export_path)
 
     def open_selected_folder(self) -> None:
         candidate = self.selected_candidate()
-        if candidate:
-            open_path(candidate.export_path.parent)
+        if not candidate:
+            messagebox.showinfo("No item selected", "Select a review item first.", parent=self)
+            return
+        open_path(candidate.export_path.parent)
 
 
 def open_review_resolver(

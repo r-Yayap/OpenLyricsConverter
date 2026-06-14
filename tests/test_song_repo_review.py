@@ -231,6 +231,33 @@ class ReviewCoreTests(unittest.TestCase):
         self.assertEqual(candidates[0].export_path, export_path)
         self.assertIn("Review lyric", candidates[0].export_text)
 
+    def test_load_review_candidates_decodes_utf16_source_text(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_dir, _export_path = self.make_output(temp_dir)
+            source_path = out_dir / "source.onsong"
+            source_path.write_text("Title: Review Song\nReview lyric\n", encoding="utf-16")
+
+            candidates = review.load_review_candidates(out_dir)
+
+        self.assertEqual(len(candidates), 1)
+        self.assertIn("Title: Review Song", candidates[0].source_text)
+
+    def test_load_review_candidates_can_defer_text_and_details(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_dir, _export_path = self.make_output(temp_dir)
+
+            candidates = review.load_review_candidates(out_dir, include_text=False, include_details=False)
+            self.assertEqual(len(candidates), 1)
+            self.assertEqual(candidates[0].export_text, "")
+            self.assertEqual(candidates[0].source_text, "")
+            self.assertEqual(candidates[0].pair_details, [])
+
+            detailed = review.load_candidate_details(out_dir, candidates[0])
+
+        self.assertIn("Review lyric", detailed.export_text)
+        self.assertIn("Title: Review Song", detailed.source_text)
+        self.assertEqual(len(detailed.pair_details), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
