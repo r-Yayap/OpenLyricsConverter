@@ -434,6 +434,128 @@ class ReviewCoreTests(unittest.TestCase):
         self.assertIn("use_selected_source", actions_by_class["multiple_chorded_sources"])
         self.assertIn("keep_unresolved", actions_by_class["needs_review"])
 
+    def test_select_default_comparison_pair_prefers_same_title_conflict_row(self):
+        candidate = self.make_candidate(
+            "title_match_lyrics_different",
+            title="At the Cross",
+            members_list=[
+                review.ReviewMember("01_FreeWorship_OpenLyrics", "At the Cross", r"C:\songs\a.xml"),
+                review.ReviewMember("02_OnSong", "At The Cross", r"C:\songs\b.onsong"),
+            ],
+            conflict_details=[
+                {
+                    "a_title": "At the Cross",
+                    "b_title": "At The Cross",
+                    "a_source": "01_FreeWorship_OpenLyrics",
+                    "b_source": "02_OnSong",
+                    "a_path": r"C:\songs\a.xml",
+                    "b_path": r"C:\songs\b.onsong",
+                    "lyric_identity_score": "0.28103",
+                    "title_score": "1.0",
+                }
+            ],
+            pair_details=[
+                {
+                    "a_title": "At the Cross",
+                    "b_title": "Other",
+                    "a_source": "01_FreeWorship_OpenLyrics",
+                    "b_source": "03_TXT_ChordPro",
+                    "a_path": r"C:\songs\a.xml",
+                    "b_path": r"C:\songs\c.txt",
+                    "lyric_identity_score": "0.9",
+                }
+            ],
+        )
+
+        pair = review.select_default_comparison_pair(candidate)
+
+        self.assertEqual(pair.source_a.source_path, r"C:\songs\a.xml")
+        self.assertEqual(pair.source_b.source_path, r"C:\songs\b.onsong")
+        self.assertIn("same title", pair.selection_reason.lower())
+        self.assertFalse(pair.fallback_to_export)
+
+    def test_load_member_text_resolves_relative_output_paths(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_dir = pathlib.Path(temp_dir)
+            source_path = out_dir / "sources" / "song.onsong"
+            source_path.parent.mkdir()
+            source_path.write_text("Title: Review Song\nLyric line\n", encoding="utf-8")
+            member = review.ReviewMember("02_OnSong", "Review Song", "sources/song.onsong")
+
+            text = review.load_member_text(out_dir, member)
+
+        self.assertIn("Lyric line", text)
+
+    def test_compute_song_diff_marks_metadata_chords_and_missing_lines(self):
+        diff = review.compute_song_diff(
+            "{title: Alpha}\n[G]Shared lyric\nOnly A\n",
+            "{title: Beta}\n[C]Shared lyric\nOnly B\n",
+            "multiple_chorded_sources",
+        )
+
+        statuses = [line.status for line in diff.lines]
+        self.assertIn("metadata", statuses)
+        self.assertIn("chord_change", statuses)
+        self.assertIn("a_only", statuses)
+        self.assertIn("b_only", statuses)
+        self.assertGreater(diff.chord_difference_count, 0)
+
+    def test_available_issue_actions_are_specific_to_issue_type(self):
+        actions_by_class = {
+            classification: [action.action_id for action in review.available_issue_actions(self.make_candidate(classification))]
+            for classification in (
+                "lyric_match_title_different",
+                "title_match_lyrics_different",
+                "multiple_chorded_sources",
+                "needs_review",
+            )
+        }
+
+        self.assertIn("use_source_a_title", actions_by_class["lyric_match_title_different"])
+        self.assertIn("use_source_b_lyrics", actions_by_class["title_match_lyrics_different"])
+        self.assertIn("use_source_a_chords", actions_by_class["multiple_chorded_sources"])
+        self.assertIn("split_not_same_song", actions_by_class["needs_review"])
+
+    def test_apply_review_decision_saves_matched_source_context(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_dir, _export_path = self.make_output(temp_dir)
+            candidate = review.load_review_candidates(out_dir)[0]
+            source_a = review.ComparisonSource(
+                marker="A",
+                source_repo="01_FreeWorship_OpenLyrics",
+                title="Review Song",
+                source_path="a.xml",
+            )
+            source_b = review.ComparisonSource(
+                marker="B",
+                source_repo="02_OnSong",
+                title="Review Song",
+                source_path="b.onsong",
+            )
+
+            review.apply_review_decision(
+                out_dir,
+                candidate,
+                chosen_classification="clean_match",
+                action="use_source_a",
+                note="manual note",
+                action_label="Use Source A",
+                source_a=source_a,
+                source_b=source_b,
+                chosen_source=source_a,
+                decision_category="lyrics",
+                auto_note="Used Source A.",
+            )
+
+            data = json.loads((out_dir / "reports" / "manual_review_decisions.json").read_text(encoding="utf-8"))
+            saved = data["decisions"][0]
+            self.assertEqual(saved["action_label"], "Use Source A")
+            self.assertEqual(saved["source_a_title"], "Review Song")
+            self.assertEqual(saved["source_b_path"], "b.onsong")
+            self.assertEqual(saved["chosen_source_marker"], "A")
+            self.assertEqual(saved["decision_category"], "lyrics")
+            self.assertIn("manual note", saved["note"])
+
 
 if __name__ == "__main__":
     unittest.main()

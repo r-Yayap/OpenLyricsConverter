@@ -27,7 +27,10 @@ try:
 except Exception:  # pragma: no cover - fallback only matters if the builder cannot import.
     song_repo_builder = None
 
-from song_repo_review_gui import open_review_resolver
+try:
+    from song_repo_review_pyside import open_review_resolver
+except Exception:  # pragma: no cover - fallback for environments without PySide6.
+    from song_repo_review_gui import open_review_resolver
 
 
 APP_DIR = Path(__file__).resolve().parent
