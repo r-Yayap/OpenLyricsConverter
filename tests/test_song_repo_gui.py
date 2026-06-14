@@ -4,7 +4,13 @@ import tempfile
 import unittest
 
 import song_repo_gui
-from song_repo_gui import DashboardSettings, build_builder_command, load_run_summary, performance_preset
+from song_repo_gui import (
+    DashboardSettings,
+    build_builder_command,
+    default_opensong_output_dir,
+    load_run_summary,
+    performance_preset,
+)
 
 
 class DashboardSettingsTests(unittest.TestCase):
@@ -118,6 +124,29 @@ class ReviewResolverLaunchTests(unittest.TestCase):
 
         self.assertEqual(calls[0][1], root / "out")
         self.assertEqual(calls[0][2], root / "cache" / "song_repo_cache.sqlite")
+
+
+class OpenSongConversionLaunchTests(unittest.TestCase):
+    def test_default_opensong_output_dir_lives_inside_output_folder(self):
+        output = pathlib.Path("C:/Songs/Output")
+
+        self.assertEqual(default_opensong_output_dir(output), output / "opensong_export")
+
+    def test_convert_existing_output_invokes_converter_with_default_folder(self):
+        calls = []
+        original = song_repo_gui.convert_chordpro_output_to_opensong
+        try:
+            song_repo_gui.convert_chordpro_output_to_opensong = lambda output, target: calls.append((output, target))
+            with tempfile.TemporaryDirectory() as temp_dir:
+                root = pathlib.Path(temp_dir)
+                settings = DashboardSettings(output=root / "out")
+                settings.output.mkdir()
+
+                song_repo_gui.convert_existing_output_to_opensong(settings)
+        finally:
+            song_repo_gui.convert_chordpro_output_to_opensong = original
+
+        self.assertEqual(calls, [(root / "out", root / "out" / "opensong_export")])
 
 
 if __name__ == "__main__":

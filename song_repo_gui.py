@@ -27,6 +27,8 @@ try:
 except Exception:  # pragma: no cover - fallback only matters if the builder cannot import.
     song_repo_builder = None
 
+from song_repo_opensong import DEFAULT_OPENSONG_EXPORT_FOLDER, convert_chordpro_output_to_opensong
+
 try:
     from song_repo_review_pyside import open_review_resolver
 except Exception:  # pragma: no cover - fallback for environments without PySide6.
@@ -196,6 +198,18 @@ def load_run_summary(out_dir: Path) -> Dict[str, Any]:
 def review_cache_db_path(settings: DashboardSettings) -> Path:
     cache_dir = settings.cache_dir if settings.cache_dir else settings.output / "_cache"
     return cache_dir / "song_repo_cache.sqlite"
+
+
+def default_opensong_output_dir(output_dir: Path) -> Path:
+    return Path(output_dir) / DEFAULT_OPENSONG_EXPORT_FOLDER
+
+
+def convert_existing_output_to_opensong(settings: DashboardSettings):
+    output_dir = Path(settings.output)
+    if not output_dir.exists() or not output_dir.is_dir():
+        raise ValueError(f"Output folder does not exist:\n{output_dir}")
+    target_dir = default_opensong_output_dir(output_dir)
+    return convert_chordpro_output_to_opensong(output_dir, target_dir)
 
 
 def open_review_resolver_for_settings(parent: tk.Misc, settings: DashboardSettings) -> None:
@@ -451,7 +465,7 @@ class SongRepoDashboard(tk.Tk):
 
         controls = ttk.Frame(parent, style="Inner.TFrame")
         controls.grid(row=2, column=0, sticky="ew", pady=(0, 12))
-        controls.grid_columnconfigure(6, weight=1)
+        controls.grid_columnconfigure(7, weight=1)
         self.start_button = ttk.Button(controls, text="Start", style="Accent.TButton", command=self._start_run)
         self.start_button.grid(row=0, column=0, sticky="w", padx=(0, 8))
         self.cancel_button = ttk.Button(controls, text="Cancel", command=self._cancel_run, state="disabled")
@@ -462,6 +476,12 @@ class SongRepoDashboard(tk.Tk):
         ttk.Button(controls, text="Review issues", command=self._open_review_issues).grid(
             row=0,
             column=5,
+            sticky="w",
+            padx=(8, 0),
+        )
+        ttk.Button(controls, text="Convert to OpenSong", command=self._convert_to_opensong).grid(
+            row=0,
+            column=6,
             sticky="w",
             padx=(8, 0),
         )
@@ -765,6 +785,27 @@ class SongRepoDashboard(tk.Tk):
             return
         settings.output.mkdir(parents=True, exist_ok=True)
         open_review_resolver_for_settings(self, settings)
+
+    def _convert_to_opensong(self) -> None:
+        try:
+            settings = self._collect_settings()
+            summary = convert_existing_output_to_opensong(settings)
+        except Exception as exc:
+            messagebox.showerror("Could not convert to OpenSong", str(exc), parent=self)
+            return
+
+        self._save_settings(settings)
+        self._append_log(
+            f"Converted {summary.converted_count} ChordPro file(s) to OpenSong: {summary.output_dir}"
+        )
+        if summary.error_count:
+            self._append_log(f"OpenSong conversion skipped {summary.error_count} file(s):")
+            for error in summary.errors[:20]:
+                self._append_log(f"  {error}")
+            if len(summary.errors) > 20:
+                self._append_log(f"  ... {len(summary.errors) - 20} more")
+        self.detail_var.set(f"OpenSong export ready: {summary.output_dir}")
+        open_in_file_manager(summary.output_dir)
 
 
 def main() -> None:
