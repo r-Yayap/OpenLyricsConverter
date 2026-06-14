@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 import shutil
 import sqlite3
 import time
@@ -16,11 +17,29 @@ import song_repo_builder as builder
 
 
 REVIEW_CLASS_KEYS = {
+    "lyric_match_title_different",
     "needs_review",
     "title_match_lyrics_different",
     "multiple_chorded_sources",
 }
 DECISIONS_FILE = Path("reports") / "manual_review_decisions.json"
+
+
+@dataclass
+class ReviewMember:
+    source_repo: str
+    title: str
+    source_path: str
+
+
+@dataclass
+class IssueExplanation:
+    label: str
+    why: str
+    what_to_check: str
+    evidence: str
+    suggested_action: str
+    severity: str = "review"
 
 
 @dataclass
@@ -36,7 +55,9 @@ class ReviewCandidate:
     source_path: str
     file_hash: str
     canonical_reason: str
+    classification_reason: str = ""
     members: str = ""
+    members_list: List[ReviewMember] = field(default_factory=list)
     best_lyric_identity_score: str = ""
     pair_details: List[Dict[str, str]] = field(default_factory=list)
     conflict_details: List[Dict[str, str]] = field(default_factory=list)
@@ -78,6 +99,178 @@ def read_text(path: Path) -> str:
         return builder.safe_read_text(path)
     except (OSError, UnicodeError):
         return ""
+
+
+def parse_members(text: str) -> List[ReviewMember]:
+    members: List[ReviewMember] = []
+    for chunk in [part.strip() for part in text.split(" || ") if part.strip()]:
+        match = re.match(r"^(?P<source>.*?): (?P<title>.*?) \[(?P<path>.*)\]$", chunk)
+        if not match:
+            members.append(ReviewMember(source_repo="", title=chunk, source_path=""))
+            continue
+        members.append(
+            ReviewMember(
+                source_repo=match.group("source").strip(),
+                title=match.group("title").strip(),
+                source_path=match.group("path").strip(),
+            )
+        )
+    return members
+
+
+def _member_count(candidate: ReviewCandidate) -> int:
+    if candidate.members_list:
+        return len(candidate.members_list)
+    return len(parse_members(candidate.members))
+
+
+def _evidence(candidate: ReviewCandidate) -> str:
+    parts = [
+        f"Title: {candidate.title or '(missing title)'}",
+        f"Sources: {_member_count(candidate)}",
+    ]
+    if candidate.best_lyric_identity_score:
+        parts.append(f"Best lyric identity score: {candidate.best_lyric_identity_score}")
+    reason = candidate.classification_reason or candidate.canonical_reason
+    if reason:
+        parts.append(f"Report reason: {reason}")
+    return " | ".join(parts)
+
+
+def issue_explanation(candidate: ReviewCandidate) -> IssueExplanation:
+    class_key = candidate.classification
+    if class_key == "lyric_match_title_different":
+        return IssueExplanation(
+            label="Lyrics match, titles differ",
+            why="The lyrics match strongly, but the titles differ between sources.",
+            what_to_check="Compare the titles and source names. Use the best title/source when they are the same song, or keep both titles if they are real separate versions.",
+            evidence=_evidence(candidate),
+            suggested_action="Use This Title, Use Selected Source, or Keep Both/All.",
+            severity="title",
+        )
+    if class_key == "title_match_lyrics_different":
+        return IssueExplanation(
+            label="Same title, different lyrics",
+            why="The same title appears with different lyrics, so the matching process could not safely choose one version.",
+            what_to_check="Compare the lyric bodies side by side. Decide whether one source is wrong, one is partial, or the versions should remain separate.",
+            evidence=_evidence(candidate),
+            suggested_action="Use Selected Source for the version to keep, or Keep Both/All when the versions are valid separate entries.",
+            severity="lyrics",
+        )
+    if class_key == "multiple_chorded_sources":
+        return IssueExplanation(
+            label="Multiple chorded sources",
+            why="Multiple chorded sources matched this song, so the best chord arrangement needs a manual choice.",
+            what_to_check="Compare chord placement, key, completeness, and source reliability. Choose the arrangement you want in the clean output or retain all valid versions.",
+            evidence=_evidence(candidate),
+            suggested_action="Use Selected Source for the preferred arrangement, or Keep Both/All if more than one arrangement should remain.",
+            severity="chords",
+        )
+    return IssueExplanation(
+        label="Needs review",
+        why="Lyrics matched, but below clean threshold or without enough confidence for automatic cleanup.",
+        what_to_check="Check whether the matched sources are the same song, a partial song, an alternate version, or a bad match.",
+        evidence=_evidence(candidate),
+        suggested_action="Use Selected Source, Mark Same Song, Keep Both/All, or Keep Unresolved.",
+        severity="review",
+    )
+
+
+def available_actions(candidate: ReviewCandidate) -> List[Dict[str, str]]:
+    common_skip = {
+        "label": "Skip",
+        "action": "skip",
+        "chosen_classification": candidate.classification,
+        "description": "Leave this item unchanged for now.",
+    }
+    keep_unresolved = {
+        "label": "Keep Unresolved",
+        "action": "keep_unresolved",
+        "chosen_classification": "needs_review",
+        "description": "Keep this in the needs-review bucket.",
+    }
+    use_selected = {
+        "label": "Use Selected Source",
+        "action": "use_selected_source",
+        "chosen_classification": "clean_match",
+        "description": "Record the selected source/member as the preferred version.",
+    }
+    keep_all = {
+        "label": "Keep Both/All",
+        "action": "retain_all",
+        "chosen_classification": candidate.classification,
+        "description": "Record that the visible versions should remain separate or all be retained.",
+    }
+
+    if candidate.classification == "lyric_match_title_different":
+        return [
+            {
+                "label": "Use This Title",
+                "action": "use_this_title",
+                "chosen_classification": "clean_match",
+                "description": "Use the candidate title as the preferred title for this song.",
+            },
+            use_selected,
+            {
+                "label": "Keep Both/All",
+                "action": "keep_both",
+                "chosen_classification": candidate.classification,
+                "description": "Keep both titles as separate valid catalog entries.",
+            },
+            keep_unresolved,
+            common_skip,
+        ]
+    if candidate.classification == "title_match_lyrics_different":
+        return [use_selected, keep_all, keep_unresolved, common_skip]
+    if candidate.classification == "multiple_chorded_sources":
+        return [use_selected, keep_all, keep_unresolved, common_skip]
+    return [
+        use_selected,
+        {
+            "label": "Mark Same Song",
+            "action": "mark_same_song",
+            "chosen_classification": "clean_match",
+            "description": "Record that the reviewed sources are the same song.",
+        },
+        keep_all,
+        keep_unresolved,
+        common_skip,
+    ]
+
+
+def filter_candidates(
+    candidates: List[ReviewCandidate],
+    issue_type: str = "",
+    status: str = "",
+    search: str = "",
+) -> List[ReviewCandidate]:
+    normalized_issue = issue_type.strip().lower()
+    normalized_status = status.strip().lower()
+    terms = [part for part in search.strip().lower().split() if part]
+
+    def matches(candidate: ReviewCandidate) -> bool:
+        if normalized_issue and normalized_issue != "all" and candidate.classification.lower() != normalized_issue:
+            return False
+        if normalized_status and normalized_status != "all" and candidate.status.lower() != normalized_status:
+            return False
+        haystack = " ".join(
+            [
+                candidate.group_id,
+                candidate.classification,
+                candidate.title,
+                candidate.artist,
+                candidate.author,
+                candidate.source_repo,
+                candidate.source_format,
+                candidate.source_path,
+                candidate.canonical_reason,
+                candidate.classification_reason,
+                candidate.members,
+            ]
+        ).lower()
+        return all(term in haystack for term in terms)
+
+    return [candidate for candidate in candidates if matches(candidate)]
 
 
 def resolve_report_path(out_dir: Path, raw_path: str) -> Path:
@@ -179,6 +372,7 @@ def load_review_candidates(
         title = row.get("title", "")
         decision = decisions.get(row.get("group_id", ""))
         status = "resolved" if decision else "unresolved"
+        members = group.get("members", "")
         candidates.append(
             ReviewCandidate(
                 group_id=row.get("group_id", ""),
@@ -192,7 +386,9 @@ def load_review_candidates(
                 source_path=row.get("source_path", ""),
                 file_hash=row.get("file_hash", ""),
                 canonical_reason=row.get("canonical_reason", ""),
-                members=group.get("members", ""),
+                classification_reason=group.get("classification_reason", ""),
+                members=members,
+                members_list=parse_members(members),
                 best_lyric_identity_score=group.get("best_lyric_identity_score", ""),
                 pair_details=_details_for_title(pair_rows, title) if include_details else [],
                 conflict_details=_details_for_title(conflict_rows, title) if include_details else [],
@@ -221,6 +417,7 @@ def load_review_candidates(
                     source_path="",
                     file_hash="",
                     canonical_reason="Found in review folder without report row",
+                    classification_reason="Found in review folder without report row",
                     export_text=read_text(export_path) if include_text else "",
                     source_text="",
                 )
