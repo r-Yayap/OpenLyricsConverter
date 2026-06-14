@@ -1808,6 +1808,25 @@ def unique_path(folder: Path, stem: str, suffix: str) -> Path:
         counter += 1
 
 
+CREATOR_FILENAME_CLASS_KEYS = {"title_match_lyrics_different", "multiple_chorded_sources"}
+
+
+def export_stem_for_classification(canonical: Song, class_key: str) -> str:
+    title = sanitize_filename(canonical.title)
+    if class_key not in CREATOR_FILENAME_CLASS_KEYS:
+        return title
+    creator = (
+        canonical.artist
+        or canonical.author
+        or Path(canonical.source_path).stem
+        or canonical.source_repo
+    )
+    creator_stem = sanitize_filename(creator)
+    if normalize_title(title) == normalize_title(creator_stem):
+        return title
+    return sanitize_filename(f"{title} - {creator_stem}")
+
+
 def chordpro_escape(value: str) -> str:
     return (value or "").replace("\n", " ").strip()
 
@@ -1949,7 +1968,7 @@ def export_results(
         )
         class_counts[class_key] += 1
         folder = out_dir / CLASS_FOLDERS[class_key]
-        stem = sanitize_filename(canonical.title)
+        stem = export_stem_for_classification(canonical, class_key)
         export_path = folder / f"{stem}.chopro"
         if not args.dry_run:
             export_path = unique_path(folder, stem, ".chopro")

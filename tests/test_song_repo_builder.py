@@ -179,6 +179,59 @@ Celebrate [F]Jesus celebrate
         self.assertNotIn("Artist: Gary Oliver", exported)
 
 
+class ExportFilenameTests(unittest.TestCase):
+    def test_review_folders_use_title_and_artist_stem(self):
+        song = builder.Song(
+            index=0,
+            source_repo=builder.ONSONG_REPO,
+            source_format="onsong",
+            source_path="source.onsong",
+            file_hash="hash",
+            size=0,
+            mtime_ns=0,
+            title="Celebrate Jesus",
+            artist="Gary Oliver",
+        )
+
+        stem = builder.export_stem_for_classification(song, "title_match_lyrics_different")
+
+        self.assertEqual(stem, "Celebrate Jesus - Gary Oliver")
+
+    def test_review_folders_fallback_to_author(self):
+        song = builder.Song(
+            index=0,
+            source_repo=builder.OPENLYRICS_REPO,
+            source_format="openlyrics",
+            source_path="source.xml",
+            file_hash="hash",
+            size=0,
+            mtime_ns=0,
+            title="In The Garden",
+            author="C. Austin Miles",
+        )
+
+        stem = builder.export_stem_for_classification(song, "multiple_chorded_sources")
+
+        self.assertEqual(stem, "In The Garden - C. Austin Miles")
+
+    def test_non_review_folders_keep_title_only_stem(self):
+        song = builder.Song(
+            index=0,
+            source_repo=builder.ONSONG_REPO,
+            source_format="onsong",
+            source_path="source.onsong",
+            file_hash="hash",
+            size=0,
+            mtime_ns=0,
+            title="Clean Title",
+            artist="Artist Name",
+        )
+
+        stem = builder.export_stem_for_classification(song, "clean_match")
+
+        self.assertEqual(stem, "Clean Title")
+
+
 class MatchingPerformanceTests(unittest.TestCase):
     def test_line_coverage_does_not_fuzzy_score_exact_shared_lines(self):
         original = builder.line_match_score
