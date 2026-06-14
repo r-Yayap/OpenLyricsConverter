@@ -8,8 +8,9 @@ import html
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -51,35 +52,130 @@ class CandidateDetails:
         candidate: review.ReviewCandidate,
         pair: review.SelectedComparisonPair,
         diff: review.SongDiffResult,
+        diff_cache_hit: bool = False,
     ) -> None:
         self.request_id = request_id
         self.candidate = candidate
         self.pair = pair
         self.diff = diff
+        self.diff_cache_hit = diff_cache_hit
 
 
-class DetailsWorker(QtCore.QObject):
+class WorkerSignals(QtCore.QObject):
     finished = QtCore.Signal(object)
     failed = QtCore.Signal(int, str)
+    status = QtCore.Signal(int, str)
 
-    def __init__(self, request_id: int, out_dir: Path, candidate: review.ReviewCandidate) -> None:
+
+class ReviewTaskToken:
+    def __init__(self) -> None:
+        self._cancelled = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancelled.set()
+
+    def cancelled(self) -> bool:
+        return self._cancelled.is_set()
+
+
+class IndexRunnable(QtCore.QRunnable):
+    def __init__(self, request_id: int, context: review.ReviewResolverContext) -> None:
         super().__init__()
         self.request_id = request_id
-        self.out_dir = Path(out_dir)
-        self.candidate = candidate
+        self.context = context
+        self.signals = WorkerSignals()
 
     @QtCore.Slot()
     def run(self) -> None:
         try:
-            candidate = review.load_candidate_details(self.out_dir, self.candidate)
+            self.context.logger.log("index_worker_start", request_id=self.request_id)
+            self.context.ensure_indexes()
+            self.context.logger.log("index_worker_done", request_id=self.request_id)
+            self.signals.finished.emit({"request_id": self.request_id})
+        except Exception as exc:
+            self.context.logger.exception("index_worker_error", exc, request_id=self.request_id)
+            self.signals.failed.emit(self.request_id, str(exc))
+
+
+class DetailsRunnable(QtCore.QRunnable):
+    def __init__(
+        self,
+        request_id: int,
+        context: review.ReviewResolverContext,
+        candidate: review.ReviewCandidate,
+        token: ReviewTaskToken,
+    ) -> None:
+        super().__init__()
+        self.request_id = request_id
+        self.context = context
+        self.candidate = candidate
+        self.token = token
+        self.signals = WorkerSignals()
+
+    def _cancelled(self, stage: str) -> bool:
+        if not self.token.cancelled():
+            return False
+        self.context.logger.log(
+            "detail_worker_cancelled",
+            request_id=self.request_id,
+            group_id=self.candidate.group_id,
+            title=self.candidate.title,
+            stage=stage,
+        )
+        return True
+
+    @QtCore.Slot()
+    def run(self) -> None:
+        try:
+            self.context.logger.log(
+                "selection_start",
+                request_id=self.request_id,
+                group_id=self.candidate.group_id,
+                title=self.candidate.title,
+            )
+            if self._cancelled("start"):
+                return
+            self.signals.status.emit(self.request_id, "Building or loading review report index...")
+            candidate = self.context.load_candidate_details(self.candidate)
+            if self._cancelled("candidate_details"):
+                return
             pair = review.select_default_comparison_pair(candidate)
-            pair = review.load_comparison_pair_texts(self.out_dir, pair)
+            if self._cancelled("select_pair"):
+                return
+            self.signals.status.emit(self.request_id, "Loading source snapshots...")
+            self.context.load_source_snapshot(pair.source_a)
+            if self._cancelled("source_a_snapshot"):
+                return
+            self.context.load_source_snapshot(pair.source_b)
+            if self._cancelled("source_b_snapshot"):
+                return
             if pair.source_b.is_export and not pair.source_b.text:
                 pair.source_b.text = candidate.export_text
-            diff = review.compute_song_diff(pair.source_a.text, pair.source_b.text, candidate.classification)
-            self.finished.emit(CandidateDetails(self.request_id, candidate, pair, diff))
+            self.signals.status.emit(self.request_id, "Loading or computing source diff...")
+            cached_diff = self.context.compute_or_load_diff(pair, candidate.classification)
+            if self._cancelled("diff"):
+                return
+            self.context.logger.log(
+                "render_prepare",
+                request_id=self.request_id,
+                group_id=candidate.group_id,
+                title=candidate.title,
+                diff_cache_hit=int(cached_diff.cache_hit),
+                source_a_path=pair.source_a.source_path,
+                source_b_path=pair.source_b.source_path,
+            )
+            self.signals.finished.emit(
+                CandidateDetails(self.request_id, candidate, pair, cached_diff.result, cached_diff.cache_hit)
+            )
         except Exception as exc:
-            self.failed.emit(self.request_id, str(exc))
+            self.context.logger.exception(
+                "detail_worker_error",
+                exc,
+                request_id=self.request_id,
+                group_id=self.candidate.group_id,
+                title=self.candidate.title,
+            )
+            self.signals.failed.emit(self.request_id, str(exc))
 
 
 class ReviewResolverWindow(QtWidgets.QMainWindow):
@@ -95,8 +191,17 @@ class ReviewResolverWindow(QtWidgets.QMainWindow):
         self.source_rows: List[review.ComparisonSource] = []
         self._preferred_row_after_refresh: Optional[int] = None
         self._request_id = 0
-        self._worker_threads: List[QtCore.QThread] = []
-        self._workers: List[DetailsWorker] = []
+        self._index_request_id = 0
+        self._detail_token: Optional[ReviewTaskToken] = None
+        self._index_pool = QtCore.QThreadPool(self)
+        self._index_pool.setMaxThreadCount(1)
+        self._detail_pool = QtCore.QThreadPool(self)
+        self._detail_pool.setMaxThreadCount(1)
+        self.context = review.ReviewResolverContext.open(
+            self.output_dir,
+            builder_cache_db_path=self.cache_db_path,
+            logger=review.ReviewDebugLogger(self.output_dir),
+        )
         self._action_buttons: List[QtWidgets.QPushButton] = []
 
         self.setWindowTitle("Manual Review Resolver")
@@ -122,10 +227,13 @@ class ReviewResolverWindow(QtWidgets.QMainWindow):
         open_output_btn.clicked.connect(lambda: self._open_path(self.output_dir))
         open_reports_btn = QtWidgets.QPushButton("Open Reports")
         open_reports_btn.clicked.connect(lambda: self._open_path(self.output_dir / "reports"))
+        open_debug_btn = QtWidgets.QPushButton("Open Debug Log")
+        open_debug_btn.clicked.connect(self.open_debug_log)
         header.addWidget(self.output_label, 1)
         header.addWidget(refresh_btn)
         header.addWidget(open_output_btn)
         header.addWidget(open_reports_btn)
+        header.addWidget(open_debug_btn)
         layout.addLayout(header)
 
         splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
@@ -311,7 +419,31 @@ class ReviewResolverWindow(QtWidgets.QMainWindow):
             self.all_candidates = []
             self.status_label.setText(f"Could not load review items: {exc}")
             return
+        self.start_index_worker()
         self.apply_filters()
+
+    def start_index_worker(self) -> None:
+        self._index_request_id += 1
+        request_id = self._index_request_id
+        self.status_label.setText("Loading review items and warming report index...")
+        worker = IndexRunnable(request_id, self.context)
+        worker.signals.finished.connect(self.on_index_ready)
+        worker.signals.failed.connect(self.on_index_failed)
+        self._index_pool.start(worker)
+
+    @QtCore.Slot(object)
+    def on_index_ready(self, payload: object) -> None:
+        request_id = int(payload.get("request_id", 0)) if isinstance(payload, dict) else 0
+        if request_id != self._index_request_id:
+            return
+        if self.candidates:
+            self.status_label.setText(f"Report index ready. Showing {len(self.candidates)} of {len(self.all_candidates)} review item(s).")
+
+    @QtCore.Slot(int, str)
+    def on_index_failed(self, request_id: int, message: str) -> None:
+        if request_id != self._index_request_id:
+            return
+        self.status_label.setText(f"Could not build review index: {message}")
 
     def clear_filters(self) -> None:
         self.issue_filter.setCurrentIndex(0)
@@ -375,39 +507,30 @@ class ReviewResolverWindow(QtWidgets.QMainWindow):
         self.current_candidate = candidate
         self._request_id += 1
         request_id = self._request_id
+        if self._detail_token:
+            self._detail_token.cancel()
+        self._detail_token = ReviewTaskToken()
+        if hasattr(self._detail_pool, "clear"):
+            self._detail_pool.clear()
         self.set_loading_state(candidate)
-        worker = DetailsWorker(request_id, self.output_dir, candidate)
-        thread = QtCore.QThread(self)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.finished.connect(self.on_details_loaded)
-        worker.failed.connect(self.on_details_failed)
-        worker.finished.connect(thread.quit)
-        worker.failed.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        worker.failed.connect(worker.deleteLater)
-        thread.finished.connect(lambda: self._remove_worker_thread(thread))
-        thread.finished.connect(lambda: self._remove_worker(worker))
-        thread.finished.connect(thread.deleteLater)
-        self._worker_threads.append(thread)
-        self._workers.append(worker)
-        thread.start()
-
-    def _remove_worker_thread(self, thread: QtCore.QThread) -> None:
-        if thread in self._worker_threads:
-            self._worker_threads.remove(thread)
-
-    def _remove_worker(self, worker: DetailsWorker) -> None:
-        if worker in self._workers:
-            self._workers.remove(worker)
+        worker = DetailsRunnable(request_id, self.context, candidate, self._detail_token)
+        worker.signals.finished.connect(self.on_details_loaded)
+        worker.signals.failed.connect(self.on_details_failed)
+        worker.signals.status.connect(self.on_worker_status)
+        self._detail_pool.start(worker)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802 - Qt override name
         self._request_id += 1
-        for thread in list(self._worker_threads):
-            thread.quit()
-            thread.wait(3000)
-        self._worker_threads.clear()
-        self._workers.clear()
+        if self._detail_token:
+            self._detail_token.cancel()
+        if hasattr(self._detail_pool, "clear"):
+            self._detail_pool.clear()
+        if hasattr(self._index_pool, "clear"):
+            self._index_pool.clear()
+        detail_done = self._detail_pool.waitForDone(5000)
+        index_done = self._index_pool.waitForDone(5000)
+        if detail_done and index_done:
+            self.context.close()
         super().closeEvent(event)
 
     def set_loading_state(self, candidate: review.ReviewCandidate) -> None:
@@ -427,14 +550,31 @@ class ReviewResolverWindow(QtWidgets.QMainWindow):
         self.current_candidate = details.candidate
         self.current_pair = details.pair
         self.current_diff = details.diff
+        self.context.logger.log(
+            "render",
+            request_id=details.request_id,
+            group_id=details.candidate.group_id,
+            title=details.candidate.title,
+            diff_cache_hit=int(details.diff_cache_hit),
+            simplified=int(details.diff.simplified),
+            truncated=int(details.diff.truncated),
+        )
         self.render_details(details.candidate, details.pair, details.diff)
-        self.status_label.setText(f"Loaded {details.candidate.title}.")
+        cache_text = "cache hit" if details.diff_cache_hit else "computed"
+        self.status_label.setText(f"Loaded {details.candidate.title} ({cache_text}).")
 
     @QtCore.Slot(int, str)
     def on_details_failed(self, request_id: int, message: str) -> None:
         if request_id != self._request_id:
             return
+        self.context.logger.log("detail_load_failed", request_id=request_id, message=message)
         self.status_label.setText(f"Could not load details: {message}")
+
+    @QtCore.Slot(int, str)
+    def on_worker_status(self, request_id: int, message: str) -> None:
+        if request_id != self._request_id:
+            return
+        self.status_label.setText(message)
 
     def render_details(
         self,
@@ -452,7 +592,15 @@ class ReviewResolverWindow(QtWidgets.QMainWindow):
             f"Diff: {diff.summary}"
         )
         self.recommended_label.setText(f"Recommended next action: {self._recommended_action_label(candidate)}")
-        self.selection_reason.setText(pair.selection_reason)
+        notes = [pair.selection_reason]
+        for source in (pair.source_a, pair.source_b):
+            if source.warning:
+                notes.append(f"Source {source.marker} warning: {source.warning}")
+        if diff.simplified:
+            notes.append("Large input: simplified diff mode was used.")
+        if diff.truncated:
+            notes.append("Large diff: rendered lines were truncated.")
+        self.selection_reason.setText("\n".join(part for part in notes if part))
         self.populate_sources(candidate, pair)
         self.source_a_title.setText(self._source_label(pair.source_a))
         self.source_b_title.setText(self._source_label(pair.source_b))
@@ -469,7 +617,9 @@ class ReviewResolverWindow(QtWidgets.QMainWindow):
         return "Review manually"
 
     def _source_label(self, source: review.ComparisonSource) -> str:
-        return f"Source {source.marker}: {source.source_repo} | {source.title}"
+        cache = "cached" if source.snapshot_cache_hit else source.snapshot_source
+        cache_text = f" | {cache}" if cache else ""
+        return f"Source {source.marker}: {source.source_repo} | {source.title}{cache_text}"
 
     def populate_sources(self, candidate: review.ReviewCandidate, pair: review.SelectedComparisonPair) -> None:
         members = candidate.members_list or review.parse_members(candidate.members)
@@ -487,6 +637,11 @@ class ReviewResolverWindow(QtWidgets.QMainWindow):
                 existing.line_count = selected.line_count
                 existing.completeness = selected.completeness
                 existing.is_export = selected.is_export
+                existing.file_hash = selected.file_hash
+                existing.snapshot_key = selected.snapshot_key
+                existing.snapshot_cache_hit = selected.snapshot_cache_hit
+                existing.snapshot_source = selected.snapshot_source
+                existing.warning = selected.warning
             else:
                 rows.append(selected)
         self.source_rows = rows
@@ -513,7 +668,19 @@ class ReviewResolverWindow(QtWidgets.QMainWindow):
             return
         selected = self.source_rows[row]
         selected.marker = marker
-        selected = review.load_comparison_source_text(self.output_dir, selected)
+        try:
+            self.context.load_source_snapshot(selected)
+        except Exception as exc:
+            self.context.logger.exception(
+                "manual_source_snapshot_error",
+                exc,
+                group_id=self.current_candidate.group_id,
+                title=self.current_candidate.title,
+                marker=marker,
+                source_path=selected.source_path,
+            )
+            self.status_label.setText(f"Could not load selected source: {exc}")
+            return
         if marker == "A":
             selected.marker = "A"
             self.current_pair.source_a = selected
@@ -522,12 +689,21 @@ class ReviewResolverWindow(QtWidgets.QMainWindow):
             self.current_pair.source_b = selected
         self.current_pair.selection_reason = f"Manual override: {selected.title} was set as Source {marker}."
         self.current_pair.fallback_to_export = self.current_pair.source_a.is_export or self.current_pair.source_b.is_export
-        self.current_diff = review.compute_song_diff(
-            self.current_pair.source_a.text,
-            self.current_pair.source_b.text,
-            self.current_candidate.classification,
-        )
+        try:
+            cached_diff = self.context.compute_or_load_diff(self.current_pair, self.current_candidate.classification)
+        except Exception as exc:
+            self.context.logger.exception(
+                "manual_diff_error",
+                exc,
+                group_id=self.current_candidate.group_id,
+                title=self.current_candidate.title,
+                marker=marker,
+            )
+            self.status_label.setText(f"Could not compute selected source diff: {exc}")
+            return
+        self.current_diff = cached_diff.result
         self.render_details(self.current_candidate, self.current_pair, self.current_diff)
+        self.status_label.setText(f"Updated Source {marker} comparison.")
 
     def _set_source_row(self, row: int, marker: str, repo: str, title: str, path: str, chords: str, complete: str) -> None:
         values = [marker, repo, title, path, chords, complete]
@@ -582,8 +758,17 @@ class ReviewResolverWindow(QtWidgets.QMainWindow):
         for button in self._action_buttons:
             button.setEnabled(False)
         self._preferred_row_after_refresh = max(0, self.issue_table.currentRow())
+        self.context.logger.log(
+            "save_decision_start",
+            group_id=candidate.group_id,
+            title=candidate.title,
+            action=action.action_id,
+            chosen_classification=action.chosen_classification,
+            source_a_path=pair.source_a.source_path,
+            source_b_path=pair.source_b.source_path,
+        )
         try:
-            review.apply_review_decision(
+            decision = review.apply_review_decision(
                 self.output_dir,
                 candidate,
                 chosen_classification=action.chosen_classification,
@@ -598,10 +783,24 @@ class ReviewResolverWindow(QtWidgets.QMainWindow):
                 auto_note=auto_note,
             )
         except Exception as exc:
+            self.context.logger.exception(
+                "save_decision_error",
+                exc,
+                group_id=candidate.group_id,
+                title=candidate.title,
+                action=action.action_id,
+            )
             self.status_label.setText(f"Could not save decision: {exc}")
             for button in self._action_buttons:
                 button.setEnabled(True)
             return
+        self.context.logger.log(
+            "save_decision_done",
+            group_id=candidate.group_id,
+            title=candidate.title,
+            action=action.action_id,
+            final_export_path=decision.final_export_path,
+        )
         self.note_box.clear()
         self.status_label.setText(f"Saved: {action.label} for {candidate.title}")
         self.refresh()
@@ -641,14 +840,28 @@ class ReviewResolverWindow(QtWidgets.QMainWindow):
         self.export_text.clear()
         self._clear_actions()
 
+    def open_debug_log(self) -> None:
+        path = self.output_dir / review.REVIEW_RESOLVER_DEBUG_FILE
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            path.write_text("", encoding="utf-8")
+        self._open_path(path)
+
     def _open_path(self, path: Path) -> None:
         path = Path(path)
-        if sys.platform.startswith("win"):
-            os.startfile(str(path))  # type: ignore[attr-defined]
-        elif sys.platform == "darwin":
-            subprocess.Popen(["open", str(path)])
-        else:
-            subprocess.Popen(["xdg-open", str(path)])
+        try:
+            if not path.exists():
+                self.status_label.setText(f"Path does not exist: {path}")
+                return
+            if sys.platform.startswith("win"):
+                os.startfile(str(path))  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(path)])
+            else:
+                subprocess.Popen(["xdg-open", str(path)])
+            self.status_label.setText(f"Opened: {path}")
+        except Exception as exc:
+            self.status_label.setText(f"Could not open {path}: {exc}")
 
 
 def run_app(output_dir: Path, cache_db_path: Optional[Path] = None) -> int:

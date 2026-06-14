@@ -5,11 +5,15 @@ from __future__ import annotations
 
 import csv
 import difflib
+import hashlib
 import json
+import os
 import re
 import shutil
 import sqlite3
+import threading
 import time
+import traceback
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -24,6 +28,13 @@ REVIEW_CLASS_KEYS = {
     "multiple_chorded_sources",
 }
 DECISIONS_FILE = Path("reports") / "manual_review_decisions.json"
+REVIEW_RESOLVER_CACHE_FILE = Path("reports") / "review_resolver_cache.sqlite"
+REVIEW_RESOLVER_DEBUG_FILE = Path("reports") / "review_resolver_debug.log"
+SNAPSHOT_VERSION = "review_snapshot.2026.06.14.2"
+DIFF_VERSION = "song_diff.2026.06.14.2"
+DEFAULT_MAX_FULL_DIFF_LINES = 1200
+DEFAULT_MAX_RENDER_DIFF_LINES = 900
+DEFAULT_MAX_DIFF_CELLS = 350_000
 META_LINE_RE = re.compile(
     r"^\s*(?:\{[^}]+:\s*.*\}|(?:Title|Artist|Author|Key|Original Key|Book|Notes|Scripture):)",
     re.I,
@@ -45,6 +56,11 @@ class ComparisonSource:
     title: str
     source_path: str
     text: str = ""
+    file_hash: str = ""
+    snapshot_key: str = ""
+    snapshot_cache_hit: bool = False
+    snapshot_source: str = ""
+    warning: str = ""
     has_chords: bool = False
     chord_count: int = 0
     line_count: int = 0
@@ -78,6 +94,29 @@ class SongDiffResult:
     summary: str
     likely_partial_side: str = ""
     likely_separate_song: bool = False
+    simplified: bool = False
+    truncated: bool = False
+
+
+@dataclass
+class SourceSnapshot:
+    source: ComparisonSource
+    text: str
+    file_hash: str
+    snapshot_key: str
+    cache_hit: bool
+    snapshot_source: str
+    warning: str = ""
+    has_chords: bool = False
+    chord_count: int = 0
+    line_count: int = 0
+
+
+@dataclass
+class CachedDiffResult:
+    result: SongDiffResult
+    cache_hit: bool
+    diff_key: str
 
 
 @dataclass
@@ -172,6 +211,87 @@ def read_text(path: Path) -> str:
         return builder.safe_read_text(path)
     except (OSError, UnicodeError):
         return ""
+
+
+def _hash_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _now_perf() -> float:
+    return time.perf_counter()
+
+
+def _elapsed_ms(start: float) -> int:
+    return int((time.perf_counter() - start) * 1000)
+
+
+class ReviewDebugLogger:
+    def __init__(self, out_dir: Path, echo: Optional[bool] = None) -> None:
+        self.out_dir = Path(out_dir)
+        self.path = self.out_dir / REVIEW_RESOLVER_DEBUG_FILE
+        self.echo = bool(os.environ.get("SONG_REPO_REVIEW_DEBUG")) if echo is None else echo
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def log(self, stage: str, **fields: Any) -> None:
+        payload = {
+            "ts": now_iso(),
+            "stage": stage,
+            **{key: str(value) for key, value in fields.items()},
+        }
+        line = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        try:
+            with self.path.open("a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+        except OSError:
+            pass
+        if self.echo:
+            print(line, flush=True)
+
+    def exception(self, stage: str, exc: BaseException, **fields: Any) -> None:
+        self.log(
+            stage,
+            error_type=type(exc).__name__,
+            error=str(exc),
+            traceback=traceback.format_exc(),
+            **fields,
+        )
+
+
+def diff_result_to_json(result: SongDiffResult) -> Dict[str, Any]:
+    return {
+        "lines": [asdict(line) for line in result.lines],
+        "lyric_similarity": result.lyric_similarity,
+        "chord_difference_count": result.chord_difference_count,
+        "metadata_difference_count": result.metadata_difference_count,
+        "summary": result.summary,
+        "likely_partial_side": result.likely_partial_side,
+        "likely_separate_song": result.likely_separate_song,
+        "simplified": result.simplified,
+        "truncated": result.truncated,
+    }
+
+
+def diff_result_from_json(data: Dict[str, Any]) -> SongDiffResult:
+    return SongDiffResult(
+        lines=[
+            DiffLine(
+                left=str(line.get("left", "")),
+                right=str(line.get("right", "")),
+                status=str(line.get("status", "")),
+                note=str(line.get("note", "")),
+            )
+            for line in data.get("lines", [])
+            if isinstance(line, dict)
+        ],
+        lyric_similarity=float(data.get("lyric_similarity", 0.0) or 0.0),
+        chord_difference_count=int(data.get("chord_difference_count", 0) or 0),
+        metadata_difference_count=int(data.get("metadata_difference_count", 0) or 0),
+        summary=str(data.get("summary", "")),
+        likely_partial_side=str(data.get("likely_partial_side", "")),
+        likely_separate_song=bool(data.get("likely_separate_song", False)),
+        simplified=bool(data.get("simplified", False)),
+        truncated=bool(data.get("truncated", False)),
+    )
 
 
 def parse_members(text: str) -> List[ReviewMember]:
@@ -551,9 +671,88 @@ def _line_status(left: str, right: str, left_norm: str, right_norm: str) -> str:
     return "changed"
 
 
-def compute_song_diff(text_a: str, text_b: str, classification: str = "") -> SongDiffResult:
+def _render_limited_lines(lines: List[DiffLine], max_render_lines: int) -> tuple[List[DiffLine], bool]:
+    if max_render_lines <= 0 or len(lines) <= max_render_lines:
+        return lines, False
+    limited = lines[:max_render_lines]
+    limited.append(DiffLine("... diff truncated ...", "... diff truncated ...", "changed", "large diff truncated"))
+    return limited, True
+
+
+def _compute_simplified_song_diff(
+    lines_a: List[str],
+    lines_b: List[str],
+    classification: str,
+    max_render_lines: int,
+) -> SongDiffResult:
+    diff_lines: List[DiffLine] = []
+    max_len = max(len(lines_a), len(lines_b))
+    for index in range(max_len):
+        if max_render_lines > 0 and len(diff_lines) >= max_render_lines:
+            break
+        left = lines_a[index] if index < len(lines_a) else ""
+        right = lines_b[index] if index < len(lines_b) else ""
+        if left and right:
+            diff_lines.append(DiffLine(left, right, _line_status(left, right, _normalize_lyric_line(left), _normalize_lyric_line(right))))
+        elif left:
+            diff_lines.append(DiffLine(left, "", "a_only"))
+        elif right:
+            diff_lines.append(DiffLine("", right, "b_only"))
+    truncated = max_len > len(diff_lines)
+    if truncated:
+        diff_lines.append(DiffLine("... large diff truncated ...", "... large diff truncated ...", "changed"))
+
+    lyric_a = [_normalize_lyric_line(line) for line in lines_a if _normalize_lyric_line(line)]
+    lyric_b = [_normalize_lyric_line(line) for line in lines_b if _normalize_lyric_line(line)]
+    lyric_similarity = difflib.SequenceMatcher(
+        a="\n".join(lyric_a[:200]),
+        b="\n".join(lyric_b[:200]),
+        autojunk=False,
+    ).ratio()
+    chord_difference_count = sum(1 for line in diff_lines if line.status == "chord_change")
+    metadata_difference_count = sum(1 for line in diff_lines if line.status == "metadata" and line.left != line.right)
+    likely_partial_side = ""
+    if lyric_a and lyric_b:
+        if len(lyric_a) <= max(2, int(len(lyric_b) * 0.55)):
+            likely_partial_side = "A"
+        elif len(lyric_b) <= max(2, int(len(lyric_a) * 0.55)):
+            likely_partial_side = "B"
+    likely_separate_song = classification == "title_match_lyrics_different" and lyric_similarity < 0.35
+    summary = (
+        f"Simplified diff used for large input; lyric similarity {lyric_similarity:.2f}; "
+        f"{chord_difference_count} chord-only difference(s); {metadata_difference_count} metadata difference(s)"
+    )
+    if truncated:
+        summary += "; rendered diff truncated"
+    return SongDiffResult(
+        lines=diff_lines,
+        lyric_similarity=lyric_similarity,
+        chord_difference_count=chord_difference_count,
+        metadata_difference_count=metadata_difference_count,
+        summary=summary,
+        likely_partial_side=likely_partial_side,
+        likely_separate_song=likely_separate_song,
+        simplified=True,
+        truncated=truncated,
+    )
+
+
+def compute_song_diff(
+    text_a: str,
+    text_b: str,
+    classification: str = "",
+    max_full_lines: int = DEFAULT_MAX_FULL_DIFF_LINES,
+    max_render_lines: int = DEFAULT_MAX_RENDER_DIFF_LINES,
+    max_cells: int = DEFAULT_MAX_DIFF_CELLS,
+) -> SongDiffResult:
     lines_a = text_a.splitlines()
     lines_b = text_b.splitlines()
+    if (
+        len(lines_a) + len(lines_b) > max_full_lines
+        or len(lines_a) * max(1, len(lines_b)) > max_cells
+    ):
+        return _compute_simplified_song_diff(lines_a, lines_b, classification, max_render_lines)
+
     norm_a = [_normalize_lyric_line(line) or line.strip().lower() for line in lines_a]
     norm_b = [_normalize_lyric_line(line) or line.strip().lower() for line in lines_b]
     matcher = difflib.SequenceMatcher(a=norm_a, b=norm_b, autojunk=False)
@@ -616,6 +815,9 @@ def compute_song_diff(text_a: str, text_b: str, classification: str = "") -> Son
         summary_parts.append(f"Source {likely_partial_side} may be partial")
     if likely_separate_song:
         summary_parts.append("sources may be separate songs")
+    diff_lines, truncated = _render_limited_lines(diff_lines, max_render_lines)
+    if truncated:
+        summary_parts.append("rendered diff truncated")
     return SongDiffResult(
         lines=diff_lines,
         lyric_similarity=lyric_similarity,
@@ -624,6 +826,8 @@ def compute_song_diff(text_a: str, text_b: str, classification: str = "") -> Son
         summary="; ".join(summary_parts),
         likely_partial_side=likely_partial_side,
         likely_separate_song=likely_separate_song,
+        simplified=False,
+        truncated=truncated,
     )
 
 
@@ -693,6 +897,525 @@ def build_decision_note(
     if user_note.strip():
         parts.append(user_note.strip())
     return " | ".join(parts)
+
+
+def _normalized_title(value: str) -> str:
+    try:
+        return builder.normalize_title(value)
+    except AttributeError:
+        value = re.sub(r"[^a-z0-9]+", " ", value.lower())
+        return re.sub(r"\s+", " ", value).strip()
+
+
+def _guess_source_format(path: Path, source_repo: str = "") -> str:
+    suffix = path.suffix.lower()
+    if suffix == ".xml":
+        return "openlyrics"
+    if suffix == ".onsong":
+        return "onsong"
+    return "txt_chordpro"
+
+
+def _snapshot_text_from_parsed(parsed: Dict[str, Any]) -> str:
+    lines: List[str] = []
+    for directive, key in (
+        ("title", "title"),
+        ("artist", "artist"),
+        ("author", "author"),
+        ("key", "key"),
+        ("tempo", "tempo"),
+        ("time", "time_signature"),
+        ("copyright", "copyright"),
+    ):
+        value = str(parsed.get(key, "") or "").strip()
+        if value:
+            lines.append(f"{{{directive}: {value}}}")
+    chordpro_body = str(parsed.get("chordpro_body", "") or "").strip()
+    plain_lyrics = str(parsed.get("plain_lyrics", "") or "").strip()
+    body = chordpro_body if parsed.get("has_chords") and chordpro_body else plain_lyrics
+    if body:
+        if lines:
+            lines.append("")
+        lines.extend(body.splitlines())
+    return "\n".join(lines).strip()
+
+
+def _source_features_from_text(text: str) -> Dict[str, Any]:
+    return detect_song_features(text)
+
+
+class ReviewResolverContext:
+    def __init__(
+        self,
+        out_dir: Path,
+        builder_cache_db_path: Optional[Path] = None,
+        logger: Optional[ReviewDebugLogger] = None,
+    ) -> None:
+        self.out_dir = Path(out_dir)
+        self.reports_dir = self.out_dir / "reports"
+        self.reports_dir.mkdir(parents=True, exist_ok=True)
+        self.cache_path = self.out_dir / REVIEW_RESOLVER_CACHE_FILE
+        self.builder_cache_db_path = self._resolve_builder_cache_path(builder_cache_db_path)
+        self.logger = logger or ReviewDebugLogger(self.out_dir)
+        self._lock = threading.RLock()
+        self._index_lock = threading.Lock()
+        self._closed = False
+        self.conn = sqlite3.connect(str(self.cache_path), check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        self._init_schema()
+
+    @classmethod
+    def open(
+        cls,
+        out_dir: Path,
+        builder_cache_db_path: Optional[Path] = None,
+        logger: Optional[ReviewDebugLogger] = None,
+    ) -> "ReviewResolverContext":
+        return cls(out_dir, builder_cache_db_path=builder_cache_db_path, logger=logger)
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self.conn.commit()
+            self.conn.close()
+            self._closed = True
+
+    def __enter__(self) -> "ReviewResolverContext":
+        return self
+
+    def __exit__(self, _exc_type: object, _exc: object, _tb: object) -> None:
+        self.close()
+
+    def _resolve_builder_cache_path(self, configured: Optional[Path]) -> Optional[Path]:
+        candidates: List[Path] = []
+        if configured:
+            candidates.append(Path(configured))
+        candidates.extend(
+            [
+                self.out_dir / "song_repo_cache.sqlite",
+                self.out_dir / "_cache" / "song_repo_cache.sqlite",
+            ]
+        )
+        for path in candidates:
+            if path.exists():
+                return path
+        return Path(configured) if configured else None
+
+    def _init_schema(self) -> None:
+        with self._lock:
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS report_index_meta (
+                    report_name TEXT PRIMARY KEY,
+                    report_path TEXT NOT NULL,
+                    size INTEGER NOT NULL,
+                    mtime_ns INTEGER NOT NULL,
+                    row_count INTEGER NOT NULL,
+                    indexed_at TEXT NOT NULL
+                )
+                """
+            )
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS report_rows (
+                    report_name TEXT NOT NULL,
+                    norm_title TEXT NOT NULL,
+                    row_json TEXT NOT NULL
+                )
+                """
+            )
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_report_rows_lookup ON report_rows(report_name, norm_title)"
+            )
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS source_snapshots (
+                    snapshot_key TEXT PRIMARY KEY,
+                    source_path TEXT NOT NULL,
+                    file_hash TEXT NOT NULL,
+                    parser_version TEXT NOT NULL,
+                    snapshot_version TEXT NOT NULL,
+                    source_repo TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    has_chords INTEGER NOT NULL,
+                    chord_count INTEGER NOT NULL,
+                    line_count INTEGER NOT NULL,
+                    snapshot_source TEXT NOT NULL,
+                    warning TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS diff_cache (
+                    diff_key TEXT PRIMARY KEY,
+                    source_a_key TEXT NOT NULL,
+                    source_b_key TEXT NOT NULL,
+                    classification TEXT NOT NULL,
+                    diff_version TEXT NOT NULL,
+                    result_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            self.conn.commit()
+
+    def ensure_indexes(self) -> None:
+        with self._index_lock:
+            start = _now_perf()
+            for report_name, filename in (
+                ("pair_scores", "07_group_pair_scores.csv"),
+                ("title_conflicts", "08_same_title_different_lyrics.csv"),
+            ):
+                self._ensure_report_index(report_name, self.reports_dir / filename)
+            self.logger.log("ensure_indexes", elapsed_ms=_elapsed_ms(start), cache_path=self.cache_path)
+
+    def _report_is_indexed(self, report_name: str, path: Path) -> bool:
+        if not path.exists():
+            return True
+        stat = path.stat()
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT size, mtime_ns FROM report_index_meta WHERE report_name = ?",
+                (report_name,),
+            ).fetchone()
+        return bool(row and int(row["size"]) == stat.st_size and int(row["mtime_ns"]) == stat.st_mtime_ns)
+
+    def _ensure_report_index(self, report_name: str, path: Path) -> None:
+        if self._report_is_indexed(report_name, path):
+            self.logger.log("report_index_hit", report_name=report_name, path=path)
+            return
+        start = _now_perf()
+        row_count = 0
+        indexed_rows: List[tuple[str, str, str]] = []
+        if path.exists():
+            with path.open("r", encoding="utf-8-sig", newline="") as handle:
+                for row in csv.DictReader(handle):
+                    row_count += 1
+                    row_json = json.dumps(row, ensure_ascii=False)
+                    titles = {
+                        _normalized_title(str(row.get("a_title", "") or "")),
+                        _normalized_title(str(row.get("b_title", "") or "")),
+                        _normalized_title(str(row.get("title", "") or "")),
+                        _normalized_title(str(row.get("canonical_title", "") or "")),
+                    }
+                    for title in titles:
+                        if title:
+                            indexed_rows.append((report_name, title, row_json))
+        stat_size = path.stat().st_size if path.exists() else 0
+        stat_mtime = path.stat().st_mtime_ns if path.exists() else 0
+        with self._lock:
+            self.conn.execute("DELETE FROM report_rows WHERE report_name = ?", (report_name,))
+            if indexed_rows:
+                self.conn.executemany(
+                    "INSERT INTO report_rows (report_name, norm_title, row_json) VALUES (?, ?, ?)",
+                    indexed_rows,
+                )
+            self.conn.execute(
+                """
+                INSERT INTO report_index_meta (report_name, report_path, size, mtime_ns, row_count, indexed_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(report_name) DO UPDATE SET
+                    report_path = excluded.report_path,
+                    size = excluded.size,
+                    mtime_ns = excluded.mtime_ns,
+                    row_count = excluded.row_count,
+                    indexed_at = excluded.indexed_at
+                """,
+                (report_name, str(path), stat_size, stat_mtime, row_count, now_iso()),
+            )
+            self.conn.commit()
+        self.logger.log(
+            "report_index_build",
+            report_name=report_name,
+            path=path,
+            row_count=row_count,
+            indexed_entries=len(indexed_rows),
+            elapsed_ms=_elapsed_ms(start),
+        )
+
+    def _indexed_rows_for_title(self, report_name: str, title: str) -> List[Dict[str, str]]:
+        norm_title = _normalized_title(title)
+        if not norm_title:
+            return []
+        start = _now_perf()
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT row_json FROM report_rows WHERE report_name = ? AND norm_title = ?",
+                (report_name, norm_title),
+            ).fetchall()
+        parsed = [json.loads(row["row_json"]) for row in rows]
+        self.logger.log(
+            "index_lookup",
+            report_name=report_name,
+            title=title,
+            rows=len(parsed),
+            elapsed_ms=_elapsed_ms(start),
+        )
+        return parsed
+
+    def load_candidate_details(self, candidate: ReviewCandidate) -> ReviewCandidate:
+        start = _now_perf()
+        self.ensure_indexes()
+        source_path = resolve_report_path(self.out_dir, candidate.source_path)
+        candidate.export_text = read_text(candidate.export_path)
+        candidate.source_text = read_text(source_path) if source_path.exists() else ""
+        candidate.pair_details = self._indexed_rows_for_title("pair_scores", candidate.title)
+        candidate.conflict_details = self._indexed_rows_for_title("title_conflicts", candidate.title)
+        self.logger.log(
+            "load_candidate_details",
+            group_id=candidate.group_id,
+            title=candidate.title,
+            pair_rows=len(candidate.pair_details),
+            conflict_rows=len(candidate.conflict_details),
+            elapsed_ms=_elapsed_ms(start),
+        )
+        return candidate
+
+    def _builder_cache_lookup(self, path: Path, file_hash: str) -> Optional[Dict[str, Any]]:
+        if not self.builder_cache_db_path or not self.builder_cache_db_path.exists():
+            return None
+        try:
+            conn = sqlite3.connect(str(self.builder_cache_db_path))
+            conn.row_factory = sqlite3.Row
+            try:
+                if not file_hash:
+                    row = conn.execute(
+                        "SELECT file_hash FROM source_files WHERE path = ?",
+                        (str(path),),
+                    ).fetchone()
+                    if row:
+                        file_hash = str(row["file_hash"])
+                if not file_hash:
+                    return None
+                parsed = conn.execute(
+                    """
+                    SELECT * FROM parsed_songs
+                    WHERE file_hash = ? AND parser_version = ?
+                    """,
+                    (file_hash, builder.PARSER_VERSION),
+                ).fetchone()
+                if not parsed:
+                    return None
+                data = dict(parsed)
+                data["lyric_lines"] = json.loads(data.pop("lyric_lines_json") or "[]")
+                data["source_meta"] = json.loads(data.pop("source_meta_json") or "{}")
+                data["file_hash"] = file_hash
+                return data
+            finally:
+                conn.close()
+        except sqlite3.Error as exc:
+            self.logger.exception("builder_cache_lookup_error", exc, path=path)
+            return None
+
+    def _source_file_hash(self, path: Path, configured_hash: str = "") -> str:
+        if configured_hash:
+            return configured_hash
+        if self.builder_cache_db_path and self.builder_cache_db_path.exists():
+            try:
+                conn = sqlite3.connect(str(self.builder_cache_db_path))
+                try:
+                    row = conn.execute("SELECT file_hash FROM source_files WHERE path = ?", (str(path),)).fetchone()
+                    if row:
+                        return str(row[0])
+                finally:
+                    conn.close()
+            except sqlite3.Error:
+                pass
+        if path.exists():
+            return builder.file_sha256(path)
+        return _hash_text(f"missing|{path}")
+
+    def _snapshot_key(self, path: Path, file_hash: str) -> str:
+        return _hash_text(f"{path}|{file_hash}|{builder.PARSER_VERSION}|{SNAPSHOT_VERSION}")
+
+    def load_source_snapshot(self, source: ComparisonSource) -> SourceSnapshot:
+        start = _now_perf()
+        path = resolve_report_path(self.out_dir, source.source_path)
+        file_hash = self._source_file_hash(path, source.file_hash)
+        snapshot_key = self._snapshot_key(path, file_hash)
+        with self._lock:
+            cached = self.conn.execute(
+                "SELECT * FROM source_snapshots WHERE snapshot_key = ?",
+                (snapshot_key,),
+            ).fetchone()
+        if cached:
+            snapshot = self._snapshot_from_row(source, cached, cache_hit=True)
+            self._apply_snapshot_to_source(source, snapshot)
+            self.logger.log(
+                "source_snapshot",
+                cache_hit=1,
+                source_path=path,
+                source=source.snapshot_source,
+                elapsed_ms=_elapsed_ms(start),
+            )
+            return snapshot
+
+        parsed = self._builder_cache_lookup(path, file_hash)
+        warning = ""
+        if parsed:
+            text = _snapshot_text_from_parsed(parsed)
+            snapshot_source = "builder_cache"
+            file_hash = str(parsed.get("file_hash") or file_hash)
+        elif path.exists():
+            try:
+                source_format = _guess_source_format(path, source.source_repo)
+                parsed = builder.parse_file(path, source_format)
+                text = _snapshot_text_from_parsed(parsed)
+                snapshot_source = "parsed_source"
+            except Exception as exc:
+                self.logger.exception("source_snapshot_parse_error", exc, source_path=path)
+                text = read_text(path)
+                warning = f"WARNING: Parsed snapshot failed; showing raw source text. {type(exc).__name__}: {exc}"
+                text = f"{warning}\n\n{text}"
+                snapshot_source = "raw_fallback"
+        else:
+            warning = "WARNING: Source file is missing; no review snapshot is available."
+            text = warning
+            snapshot_source = "missing"
+
+        features = _source_features_from_text(text)
+        snapshot = SourceSnapshot(
+            source=source,
+            text=text,
+            file_hash=file_hash,
+            snapshot_key=snapshot_key,
+            cache_hit=snapshot_source in {"builder_cache"},
+            snapshot_source=snapshot_source,
+            warning=warning,
+            has_chords=bool(features["has_chords"]),
+            chord_count=int(features["chord_count"]),
+            line_count=int(features["line_count"]),
+        )
+        self._save_source_snapshot(path, source, snapshot)
+        self._apply_snapshot_to_source(source, snapshot)
+        self.logger.log(
+            "source_snapshot",
+            cache_hit=int(snapshot.cache_hit),
+            source_path=path,
+            source=snapshot.snapshot_source,
+            elapsed_ms=_elapsed_ms(start),
+        )
+        return snapshot
+
+    def _snapshot_from_row(self, source: ComparisonSource, row: sqlite3.Row, cache_hit: bool) -> SourceSnapshot:
+        return SourceSnapshot(
+            source=source,
+            text=str(row["text"]),
+            file_hash=str(row["file_hash"]),
+            snapshot_key=str(row["snapshot_key"]),
+            cache_hit=cache_hit,
+            snapshot_source=str(row["snapshot_source"]),
+            warning=str(row["warning"]),
+            has_chords=bool(row["has_chords"]),
+            chord_count=int(row["chord_count"]),
+            line_count=int(row["line_count"]),
+        )
+
+    def _save_source_snapshot(self, path: Path, source: ComparisonSource, snapshot: SourceSnapshot) -> None:
+        with self._lock:
+            self.conn.execute(
+                """
+                INSERT INTO source_snapshots (
+                    snapshot_key, source_path, file_hash, parser_version, snapshot_version,
+                    source_repo, title, text, has_chords, chord_count, line_count,
+                    snapshot_source, warning, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(snapshot_key) DO UPDATE SET
+                    text = excluded.text,
+                    has_chords = excluded.has_chords,
+                    chord_count = excluded.chord_count,
+                    line_count = excluded.line_count,
+                    snapshot_source = excluded.snapshot_source,
+                    warning = excluded.warning
+                """,
+                (
+                    snapshot.snapshot_key,
+                    str(path),
+                    snapshot.file_hash,
+                    builder.PARSER_VERSION,
+                    SNAPSHOT_VERSION,
+                    source.source_repo,
+                    source.title,
+                    snapshot.text,
+                    int(snapshot.has_chords),
+                    snapshot.chord_count,
+                    snapshot.line_count,
+                    snapshot.snapshot_source,
+                    snapshot.warning,
+                    now_iso(),
+                ),
+            )
+            self.conn.commit()
+
+    def _apply_snapshot_to_source(self, source: ComparisonSource, snapshot: SourceSnapshot) -> None:
+        source.text = snapshot.text
+        source.file_hash = snapshot.file_hash
+        source.snapshot_key = snapshot.snapshot_key
+        source.snapshot_cache_hit = snapshot.cache_hit
+        source.snapshot_source = snapshot.snapshot_source
+        source.warning = snapshot.warning
+        source.has_chords = snapshot.has_chords
+        source.chord_count = snapshot.chord_count
+        source.line_count = snapshot.line_count
+        source.completeness = _source_features_from_text(snapshot.text).get("completeness", "")
+
+    def compute_or_load_diff(self, pair: SelectedComparisonPair, classification: str) -> CachedDiffResult:
+        start = _now_perf()
+        source_a_key = pair.source_a.file_hash or pair.source_a.snapshot_key or _hash_text(pair.source_a.text)
+        source_b_key = pair.source_b.file_hash or pair.source_b.snapshot_key or _hash_text(pair.source_b.text)
+        diff_key = _hash_text(f"{source_a_key}|{source_b_key}|{classification}|{DIFF_VERSION}")
+        with self._lock:
+            cached = self.conn.execute(
+                "SELECT result_json FROM diff_cache WHERE diff_key = ?",
+                (diff_key,),
+            ).fetchone()
+        if cached:
+            result = diff_result_from_json(json.loads(cached["result_json"]))
+            self.logger.log(
+                "diff_cache_lookup",
+                cache_hit=1,
+                diff_key=diff_key,
+                elapsed_ms=_elapsed_ms(start),
+            )
+            return CachedDiffResult(result=result, cache_hit=True, diff_key=diff_key)
+
+        result = compute_song_diff(pair.source_a.text, pair.source_b.text, classification)
+        with self._lock:
+            self.conn.execute(
+                """
+                INSERT INTO diff_cache (
+                    diff_key, source_a_key, source_b_key, classification, diff_version, result_json, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(diff_key) DO UPDATE SET
+                    result_json = excluded.result_json,
+                    created_at = excluded.created_at
+                """,
+                (
+                    diff_key,
+                    source_a_key,
+                    source_b_key,
+                    classification,
+                    DIFF_VERSION,
+                    json.dumps(diff_result_to_json(result), ensure_ascii=False),
+                    now_iso(),
+                ),
+            )
+            self.conn.commit()
+        self.logger.log(
+            "diff_compute",
+            cache_hit=0,
+            diff_key=diff_key,
+            simplified=int(result.simplified),
+            truncated=int(result.truncated),
+            elapsed_ms=_elapsed_ms(start),
+        )
+        return CachedDiffResult(result=result, cache_hit=False, diff_key=diff_key)
 
 
 def resolve_report_path(out_dir: Path, raw_path: str) -> Path:

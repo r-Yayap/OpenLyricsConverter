@@ -4,6 +4,7 @@ import pathlib
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 
 import song_repo_builder as builder
 import song_repo_review as review
@@ -555,6 +556,145 @@ class ReviewCoreTests(unittest.TestCase):
             self.assertEqual(saved["chosen_source_marker"], "A")
             self.assertEqual(saved["decision_category"], "lyrics")
             self.assertIn("manual note", saved["note"])
+
+    def test_resolver_context_indexes_pair_reports_without_rescanning_on_detail_load(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_dir, _export_path = self.make_output(temp_dir)
+            context = review.ReviewResolverContext.open(out_dir)
+            try:
+                context.ensure_indexes()
+                candidate = review.load_review_candidates(out_dir, include_text=False, include_details=False)[0]
+
+                with mock.patch("song_repo_review.read_detail_rows_for_title", side_effect=AssertionError("rescanned csv")):
+                    detailed = context.load_candidate_details(candidate)
+            finally:
+                context.close()
+
+        self.assertEqual(len(detailed.pair_details), 1)
+        self.assertEqual(detailed.pair_details[0]["a_title"], "Review Song")
+
+    def test_resolver_context_source_snapshot_uses_builder_cache(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_dir = pathlib.Path(temp_dir)
+            source_path = out_dir / "cached.onsong"
+            source_path.write_text("raw should not be used", encoding="utf-8")
+            db_path = out_dir / "song_repo_cache.sqlite"
+            cache = builder.CacheDB(db_path)
+            try:
+                file_hash = "cache-hash"
+                cache.conn.execute(
+                    """
+                    INSERT INTO source_files
+                        (path, source_repo, source_format, size, mtime_ns, file_hash, last_seen_run, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (str(source_path), builder.ONSONG_REPO, "onsong", 1, 2, file_hash, "run", "now"),
+                )
+                cache.save_parsed_song(
+                    file_hash,
+                    {
+                        "title": "Cached Song",
+                        "artist": "Cached Artist",
+                        "author": "",
+                        "key": "G",
+                        "tempo": "",
+                        "time_signature": "",
+                        "copyright": "",
+                        "has_chords": True,
+                        "chord_count": 1,
+                        "line_count": 1,
+                        "plain_lyrics": "Cached lyric",
+                        "normalized_lyrics": "cached lyric",
+                        "lyric_lines": ["cached lyric"],
+                        "chordpro_body": "[G]Cached lyric",
+                        "source_meta": {},
+                        "parse_status": "ok",
+                        "parse_error": "",
+                    },
+                )
+                cache.conn.commit()
+            finally:
+                cache.close()
+            context = review.ReviewResolverContext.open(out_dir, builder_cache_db_path=db_path)
+            try:
+                snapshot = context.load_source_snapshot(
+                    review.ComparisonSource("A", builder.ONSONG_REPO, "Cached Song", str(source_path))
+                )
+            finally:
+                context.close()
+
+        self.assertTrue(snapshot.cache_hit)
+        self.assertEqual(snapshot.snapshot_source, "builder_cache")
+        self.assertIn("{title: Cached Song}", snapshot.text)
+        self.assertIn("[G]Cached lyric", snapshot.text)
+        self.assertNotIn("raw should not be used", snapshot.text)
+
+    def test_resolver_context_source_snapshot_parses_when_builder_cache_missing(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_dir = pathlib.Path(temp_dir)
+            source_path = out_dir / "uncached.onsong"
+            source_path.write_text("Title: Parsed Song\nArtist: Writer\n[G]Parsed lyric\n", encoding="utf-8")
+            context = review.ReviewResolverContext.open(out_dir)
+            try:
+                snapshot = context.load_source_snapshot(
+                    review.ComparisonSource("A", builder.ONSONG_REPO, "Parsed Song", str(source_path))
+                )
+            finally:
+                context.close()
+
+        self.assertFalse(snapshot.cache_hit)
+        self.assertEqual(snapshot.snapshot_source, "parsed_source")
+        self.assertIn("{title: Parsed Song}", snapshot.text)
+        self.assertIn("[G]Parsed lyric", snapshot.text)
+
+    def test_resolver_context_diff_cache_reuses_saved_result(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_dir = pathlib.Path(temp_dir)
+            context = review.ReviewResolverContext.open(out_dir)
+            pair = review.SelectedComparisonPair(
+                source_a=review.ComparisonSource("A", "repo", "A", "a.txt", text="same\nA only\n", file_hash="ha"),
+                source_b=review.ComparisonSource("B", "repo", "B", "b.txt", text="same\nB only\n", file_hash="hb"),
+                selection_reason="test",
+            )
+
+            try:
+                first = context.compute_or_load_diff(pair, "needs_review")
+                with mock.patch("song_repo_review.compute_song_diff", side_effect=AssertionError("recomputed diff")):
+                    second = context.compute_or_load_diff(pair, "needs_review")
+            finally:
+                context.close()
+
+        self.assertFalse(first.cache_hit)
+        self.assertTrue(second.cache_hit)
+        self.assertEqual(first.result.summary, second.result.summary)
+
+    def test_compute_song_diff_uses_simplified_mode_for_large_inputs(self):
+        text_a = "\n".join(f"A line {index}" for index in range(40))
+        text_b = "\n".join(f"B line {index}" for index in range(40))
+
+        diff = review.compute_song_diff(text_a, text_b, "needs_review", max_full_lines=10, max_render_lines=12)
+
+        self.assertTrue(diff.simplified)
+        self.assertTrue(diff.truncated)
+        self.assertLessEqual(len(diff.lines), 13)
+        self.assertIn("simplified", diff.summary.lower())
+
+    def test_review_debug_logger_writes_stage_and_exception_details(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_dir = pathlib.Path(temp_dir)
+            logger = review.ReviewDebugLogger(out_dir, echo=False)
+            logger.log("selection_start", group_id="G1", title="Debug Song")
+            try:
+                raise RuntimeError("debug failure")
+            except RuntimeError as exc:
+                logger.exception("detail_load", exc, group_id="G1")
+
+            text = (out_dir / "reports" / "review_resolver_debug.log").read_text(encoding="utf-8")
+
+        self.assertIn("selection_start", text)
+        self.assertIn("Debug Song", text)
+        self.assertIn("detail_load", text)
+        self.assertIn("RuntimeError", text)
 
 
 if __name__ == "__main__":
