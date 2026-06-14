@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Native Windows dashboard for song_repo_builder.py.
-
+.
 The GUI intentionally launches the existing builder as a subprocess. That keeps
 parsing, matching, caching, and multiprocessing behavior in one tested pipeline.
 """
