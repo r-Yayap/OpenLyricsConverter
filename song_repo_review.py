@@ -1724,6 +1724,71 @@ def update_manual_decision_db(cache_db_path: Optional[Path], decision: ManualRev
             conn.close()
 
 
+SOURCE_REGENERATION_ACTIONS = {
+    "use_source_a",
+    "use_source_b",
+    "use_source_a_lyrics",
+    "use_source_b_lyrics",
+    "use_source_a_chords",
+    "use_source_b_chords",
+    "use_canonical_lyrics_source_a_chords",
+    "use_canonical_lyrics_source_b_chords",
+    "mark_source_a_arrangement_preferred",
+    "mark_source_b_arrangement_preferred",
+    "use_source_a_title",
+    "use_source_b_title",
+}
+TITLE_REGENERATION_ACTIONS = {"use_source_a_title", "use_source_b_title"}
+
+
+def _comparable_path(path: Path) -> str:
+    try:
+        return str(path.resolve()).casefold()
+    except OSError:
+        return str(path).casefold()
+
+
+def _chosen_source_differs_from_candidate(out_dir: Path, candidate: ReviewCandidate, chosen_source: ComparisonSource) -> bool:
+    if not chosen_source.source_path or not candidate.source_path:
+        return True
+    candidate_path = resolve_report_path(out_dir, candidate.source_path)
+    chosen_path = resolve_report_path(out_dir, chosen_source.source_path)
+    return _comparable_path(candidate_path) != _comparable_path(chosen_path)
+
+
+def _replace_or_insert_title_directive(text: str, title: str) -> str:
+    clean_title = title.strip()
+    if not clean_title:
+        return text
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if re.match(r"^\s*\{title\s*:", line, re.I) or re.match(r"^\s*title\s*:", line, re.I):
+            lines[index] = f"{{title: {clean_title}}}"
+            return "\n".join(lines)
+    return "\n".join([f"{{title: {clean_title}}}", *lines])
+
+
+def _regenerated_export_text(
+    out_dir: Path,
+    candidate: ReviewCandidate,
+    action: str,
+    chosen_source: Optional[ComparisonSource],
+    original_text: str,
+) -> Optional[str]:
+    if not chosen_source or action not in SOURCE_REGENERATION_ACTIONS:
+        return None
+    source_differs = _chosen_source_differs_from_candidate(out_dir, candidate, chosen_source)
+    if not source_differs and action not in TITLE_REGENERATION_ACTIONS:
+        return None
+
+    text = chosen_source.text.strip() or original_text.strip()
+    if not text:
+        return None
+    if action in TITLE_REGENERATION_ACTIONS:
+        text = _replace_or_insert_title_directive(text, chosen_source.title)
+    return text.rstrip() + "\n"
+
+
 def apply_review_decision(
     out_dir: Path,
     candidate: ReviewCandidate,
@@ -1744,12 +1809,16 @@ def apply_review_decision(
         raise ValueError(f"Unknown classification: {chosen_classification}")
 
     original = Path(candidate.export_path)
+    original_text = read_text(original) if original.exists() else ""
     final_path = original
     if action != "skip" and chosen_classification != candidate.classification:
         target_dir = out_dir / builder.CLASS_FOLDERS[chosen_classification]
         target_dir.mkdir(parents=True, exist_ok=True)
         final_path = builder.unique_path(target_dir, original.stem, original.suffix)
         shutil.move(str(original), str(final_path))
+    regenerated_text = _regenerated_export_text(out_dir, candidate, action, chosen_source, original_text)
+    if regenerated_text is not None:
+        final_path.write_text(regenerated_text, encoding="utf-8")
 
     user_note = note.strip()
     final_note = " | ".join(part for part in (auto_note.strip(), user_note) if part)

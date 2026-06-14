@@ -557,6 +557,96 @@ class ReviewCoreTests(unittest.TestCase):
             self.assertEqual(saved["decision_category"], "lyrics")
             self.assertIn("manual note", saved["note"])
 
+    def test_apply_review_decision_regenerates_output_from_different_chosen_source(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_dir, export_path = self.make_output(temp_dir)
+            candidate = review.load_review_candidates(out_dir)[0]
+            chosen_source = review.ComparisonSource(
+                marker="B",
+                source_repo=builder.ONSONG_REPO,
+                title="Better Source Song",
+                source_path=str(out_dir / "different.onsong"),
+                text="{title: Better Source Song}\n{artist: Better Writer}\n\n[C]Better lyric\n",
+            )
+
+            decision = review.apply_review_decision(
+                out_dir,
+                candidate,
+                chosen_classification="clean_match",
+                action="use_source_b_lyrics",
+                chosen_source=chosen_source,
+                source_b=chosen_source,
+                action_label="Use Source B Lyrics",
+            )
+
+            self.assertFalse(export_path.exists())
+            self.assertIn(builder.CLASS_FOLDERS["clean_match"], str(decision.final_export_path))
+            final_text = decision.final_export_path.read_text(encoding="utf-8")
+            self.assertIn("{title: Better Source Song}", final_text)
+            self.assertIn("[C]Better lyric", final_text)
+            self.assertNotIn("Review lyric", final_text)
+
+    def test_apply_review_decision_mark_same_song_moves_without_regenerating(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_dir, _export_path = self.make_output(temp_dir)
+            candidate = review.load_review_candidates(out_dir)[0]
+            source_a = review.ComparisonSource(
+                marker="A",
+                source_repo=builder.ONSONG_REPO,
+                title="Different Source",
+                source_path=str(out_dir / "different.onsong"),
+                text="{title: Different Source}\nShould not replace export\n",
+            )
+
+            decision = review.apply_review_decision(
+                out_dir,
+                candidate,
+                chosen_classification="clean_match",
+                action="mark_same_song",
+                source_a=source_a,
+                action_label="Mark Same Song",
+            )
+
+            final_text = decision.final_export_path.read_text(encoding="utf-8")
+            self.assertIn("{title: Review Song}", final_text)
+            self.assertIn("Review lyric", final_text)
+            self.assertNotIn("Should not replace export", final_text)
+
+    def test_apply_review_decision_use_source_title_rewrites_title_directive(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_dir = pathlib.Path(temp_dir)
+            export_dir = out_dir / builder.CLASS_FOLDERS["lyric_match_title_different"]
+            export_dir.mkdir(parents=True)
+            export_path = export_dir / "Current Title.chopro"
+            export_path.write_text("{title: Current Title}\nSame lyric\n", encoding="utf-8")
+            candidate = self.make_candidate(
+                "lyric_match_title_different",
+                export_path=export_path,
+                title="Current Title",
+                source_path=str(out_dir / "current.onsong"),
+            )
+            chosen_source = review.ComparisonSource(
+                marker="B",
+                source_repo=builder.ONSONG_REPO,
+                title="Alternate Title",
+                source_path=str(out_dir / "alternate.onsong"),
+                text="{title: Wrong Internal Title}\nSame lyric\n",
+            )
+
+            decision = review.apply_review_decision(
+                out_dir,
+                candidate,
+                chosen_classification="clean_match",
+                action="use_source_b_title",
+                chosen_source=chosen_source,
+                source_b=chosen_source,
+                action_label="Use Title from Source B",
+            )
+
+            final_text = decision.final_export_path.read_text(encoding="utf-8")
+            self.assertIn("{title: Alternate Title}", final_text)
+            self.assertNotIn("{title: Wrong Internal Title}", final_text)
+
     def test_resolver_context_indexes_pair_reports_without_rescanning_on_detail_load(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             out_dir, _export_path = self.make_output(temp_dir)
