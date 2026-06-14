@@ -33,7 +33,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 
 SCRIPT_VERSION = "2026.06.13.cached.4"
-PARSER_VERSION = "parser.2026.06.13.2"
+PARSER_VERSION = "parser.2026.06.14.1"
 MATCHER_VERSION = "matcher.lyric_identity.2026.06.13.3"
 
 
@@ -108,6 +108,31 @@ CHORD_TOKEN_RE = re.compile(
 INLINE_CHORD_RE = re.compile(r"\[([^\[\]\n]{1,32})\]")
 METADATA_RE = re.compile(r"^\s*\{([^:{}]+)\s*:\s*(.*?)\s*\}\s*$")
 COMMENT_RE = re.compile(r"^\s*\{(?:c|comment)\s*:\s*(.*?)\s*\}\s*$", re.IGNORECASE)
+BARE_METADATA_RE = re.compile(r"^\s*([A-Za-z][A-Za-z0-9 ()/_-]{0,40})\s*:\s*(.*?)\s*$")
+
+DIRECT_METADATA_FIELDS = {
+    "title": "title",
+    "t": "title",
+    "artist": "artist",
+    "subtitle": "artist",
+    "st": "artist",
+    "author": "author",
+    "key": "key",
+    "tempo": "tempo",
+    "time": "time_signature",
+    "time signature": "time_signature",
+    "time_signature": "time_signature",
+    "copyright": "copyright",
+}
+
+SOURCE_METADATA_FIELDS = {
+    "original key": "original_key",
+    "book": "book",
+    "notes": "notes",
+    "scripture reference(s)": "scripture_references",
+    "scripture references": "scripture_references",
+    "scripture reference": "scripture_references",
+}
 
 OPENLYRICS_STRUCTURE_NOTATION = {
     "major": "",
@@ -136,10 +161,12 @@ class Song:
     mtime_ns: int
     title: str = ""
     artist: str = ""
+    author: str = ""
     key: str = ""
     tempo: str = ""
     time_signature: str = ""
     copyright: str = ""
+    source_meta: Dict[str, str] = field(default_factory=dict)
     has_chords: bool = False
     chord_count: int = 0
     line_count: int = 0
@@ -381,6 +408,49 @@ def title_from_filename(path: Path) -> str:
     return stem
 
 
+def source_meta_key(name: str) -> str:
+    key = normalize_title(name).replace(" ", "_")
+    if key == "scripture_reference_s":
+        return "scripture_references"
+    return key
+
+
+def clean_metadata_value(field: str, value: str) -> str:
+    value = norm_space(value)
+    if field == "key":
+        chord_match = re.fullmatch(r"\[([^\[\]]+)\]", value)
+        if chord_match:
+            return norm_space(chord_match.group(1))
+    return value
+
+
+def parse_bare_metadata_line(line: str) -> Optional[Tuple[str, str, str]]:
+    match = BARE_METADATA_RE.match(line)
+    if not match:
+        return None
+    raw_name = norm_space(match.group(1)).lower()
+    value = norm_space(match.group(2))
+    if raw_name in DIRECT_METADATA_FIELDS:
+        field = DIRECT_METADATA_FIELDS[raw_name]
+        return ("direct", field, clean_metadata_value(field, value))
+    if raw_name in SOURCE_METADATA_FIELDS:
+        return ("source", SOURCE_METADATA_FIELDS[raw_name], value)
+    return None
+
+
+def colon_section_label(line: str) -> Optional[str]:
+    stripped = line.strip()
+    match = re.fullmatch(r"([A-Za-z][A-Za-z ]*(?:\s+\d+)?)\s*:", stripped)
+    if not match:
+        return None
+    label = norm_space(match.group(1))
+    label_base = re.sub(r"\d+", "", label.lower())
+    label_base = norm_space(label_base.replace("-", " "))
+    if label.lower() in SECTION_WORDS or label_base in SECTION_WORDS:
+        return label
+    return None
+
+
 def file_sha256(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:
@@ -442,6 +512,8 @@ class CacheDB:
             )
             """
         )
+        self.ensure_column("parsed_songs", "author", "TEXT")
+        self.ensure_column("parsed_songs", "source_meta_json", "TEXT NOT NULL DEFAULT '{}'")
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS pair_scores (
@@ -474,6 +546,12 @@ class CacheDB:
             """
         )
         self.conn.commit()
+
+    def ensure_column(self, table: str, column: str, definition: str) -> None:
+        rows = self.conn.execute(f"PRAGMA table_info({table})").fetchall()
+        existing = {str(row["name"]) for row in rows}
+        if column not in existing:
+            self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def get_cached_hash(
         self,
@@ -532,20 +610,22 @@ class CacheDB:
             return None
         data = dict(row)
         data["lyric_lines"] = json.loads(data.pop("lyric_lines_json") or "[]")
+        data["source_meta"] = json.loads(data.pop("source_meta_json") or "{}")
         return data
 
     def save_parsed_song(self, file_hash: str, data: Dict[str, Any]) -> None:
         self.conn.execute(
             """
             INSERT INTO parsed_songs (
-                file_hash, parser_version, title, artist, key, tempo, time_signature, copyright,
+                file_hash, parser_version, title, artist, author, key, tempo, time_signature, copyright,
                 has_chords, chord_count, line_count, plain_lyrics, normalized_lyrics,
-                lyric_lines_json, chordpro_body, parse_status, parse_error, created_at
+                lyric_lines_json, chordpro_body, source_meta_json, parse_status, parse_error, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(file_hash, parser_version) DO UPDATE SET
                 title = excluded.title,
                 artist = excluded.artist,
+                author = excluded.author,
                 key = excluded.key,
                 tempo = excluded.tempo,
                 time_signature = excluded.time_signature,
@@ -557,6 +637,7 @@ class CacheDB:
                 normalized_lyrics = excluded.normalized_lyrics,
                 lyric_lines_json = excluded.lyric_lines_json,
                 chordpro_body = excluded.chordpro_body,
+                source_meta_json = excluded.source_meta_json,
                 parse_status = excluded.parse_status,
                 parse_error = excluded.parse_error,
                 created_at = excluded.created_at
@@ -566,6 +647,7 @@ class CacheDB:
                 PARSER_VERSION,
                 data.get("title", ""),
                 data.get("artist", ""),
+                data.get("author", ""),
                 data.get("key", ""),
                 data.get("tempo", ""),
                 data.get("time_signature", ""),
@@ -577,6 +659,7 @@ class CacheDB:
                 data.get("normalized_lyrics", ""),
                 json.dumps(data.get("lyric_lines", []), ensure_ascii=False),
                 data.get("chordpro_body", ""),
+                json.dumps(data.get("source_meta", {}), ensure_ascii=False),
                 data.get("parse_status", "ok"),
                 data.get("parse_error", ""),
                 now_iso(),
@@ -811,7 +894,8 @@ def parse_openlyrics(path: Path) -> Dict[str, Any]:
         return parse_plain_chordpro(path, forced_error=f"XML parse failed: {exc}")
 
     title = first_xml_text(root, ("title", "songtitle")) or title_from_filename(path)
-    artist = first_xml_text(root, ("author", "artist", "composer", "writer"))
+    author = first_xml_text(root, ("author",)) or first_xml_text(root, ("composer", "writer"))
+    artist = first_xml_text(root, ("artist",))
     key = first_xml_text(root, ("key",))
     copyright_text = first_xml_text(root, ("copyright",))
 
@@ -866,10 +950,12 @@ def parse_openlyrics(path: Path) -> Dict[str, Any]:
     return {
         "title": title,
         "artist": artist,
+        "author": author,
         "key": key,
         "tempo": "",
         "time_signature": "",
         "copyright": copyright_text,
+        "source_meta": {},
         "has_chords": chord_count > 0,
         "chord_count": chord_count,
         "line_count": len(lyric_lines),
@@ -886,13 +972,16 @@ def parse_plain_chordpro(path: Path, forced_error: str = "") -> Dict[str, Any]:
     text = safe_read_text(path)
     title = ""
     artist = ""
+    author = ""
     key = ""
     tempo = ""
     time_signature = ""
     copyright_text = ""
+    source_meta: Dict[str, str] = {}
     chord_count = 0
     plain_lines: List[str] = []
     body_lines: List[str] = []
+    header_mode = True
 
     for raw_line in text.splitlines():
         line = raw_line.rstrip("\n\r")
@@ -902,20 +991,48 @@ def parse_plain_chordpro(path: Path, forced_error: str = "") -> Dict[str, Any]:
         if meta:
             name = meta.group(1).strip().lower()
             value = norm_space(meta.group(2))
-            if name in {"title", "t"}:
+            mapped = DIRECT_METADATA_FIELDS.get(name)
+            if mapped == "title":
                 title = value
-            elif name in {"artist", "subtitle", "st"}:
+            elif mapped == "artist":
                 artist = value
-            elif name == "key":
-                key = value
-            elif name == "tempo":
+            elif mapped == "author":
+                author = value
+            elif mapped == "key":
+                key = clean_metadata_value("key", value)
+            elif mapped == "tempo":
                 tempo = value
-            elif name in {"time", "time_signature"}:
+            elif mapped == "time_signature":
                 time_signature = value
-            elif name == "copyright":
+            elif mapped == "copyright":
                 copyright_text = value
             body_lines.append(line)
             continue
+
+        if header_mode:
+            bare_meta = parse_bare_metadata_line(stripped)
+            if bare_meta:
+                kind, name, value = bare_meta
+                if kind == "direct":
+                    if name == "title":
+                        title = value
+                    elif name == "artist":
+                        artist = value
+                    elif name == "author":
+                        author = value
+                    elif name == "key":
+                        key = value
+                    elif name == "tempo":
+                        tempo = value
+                    elif name == "time_signature":
+                        time_signature = value
+                    elif name == "copyright":
+                        copyright_text = value
+                else:
+                    source_meta[name] = value
+                continue
+            if stripped:
+                header_mode = False
 
         comment = COMMENT_RE.match(stripped)
         if comment:
@@ -925,6 +1042,11 @@ def parse_plain_chordpro(path: Path, forced_error: str = "") -> Dict[str, Any]:
         section = bracket_section_label(stripped)
         if section:
             body_lines.append(f"{{comment: {section}}}")
+            continue
+
+        colon_section = colon_section_label(stripped)
+        if colon_section:
+            body_lines.append(f"{{comment: {colon_section}}}")
             continue
 
         no_chords, found_chords = strip_inline_chords(line)
@@ -951,10 +1073,12 @@ def parse_plain_chordpro(path: Path, forced_error: str = "") -> Dict[str, Any]:
     return {
         "title": title,
         "artist": artist,
+        "author": author,
         "key": key,
         "tempo": tempo,
         "time_signature": time_signature,
         "copyright": copyright_text,
+        "source_meta": source_meta,
         "has_chords": chord_count > 0,
         "chord_count": chord_count,
         "line_count": len(lyric_lines),
@@ -1019,10 +1143,12 @@ def song_from_parsed(
         mtime_ns=mtime_ns,
         title=parsed.get("title", "") or title_from_filename(path),
         artist=parsed.get("artist", "") or "",
+        author=parsed.get("author", "") or "",
         key=parsed.get("key", "") or "",
         tempo=parsed.get("tempo", "") or "",
         time_signature=parsed.get("time_signature", "") or "",
         copyright=parsed.get("copyright", "") or "",
+        source_meta=dict(parsed.get("source_meta") or {}),
         has_chords=bool(parsed.get("has_chords")),
         chord_count=int(parsed.get("chord_count") or 0),
         line_count=int(parsed.get("line_count") or 0),
@@ -1700,10 +1826,14 @@ def build_export_text(
 
     add_meta("title", canonical.title)
     add_meta("artist", canonical.artist)
+    add_meta("author", canonical.author)
     add_meta("key", canonical.key)
     add_meta("tempo", canonical.tempo)
     add_meta("time", canonical.time_signature)
     add_meta("copyright", canonical.copyright)
+    for key, value in sorted(canonical.source_meta.items()):
+        if value:
+            lines.append(f"{{meta: {source_meta_key(key)} {chordpro_escape(value)}}}")
     lines.append(f"{{meta: canonical_group_id {group_id}}}")
     lines.append(f"{{meta: canonical_reason {canonical_reason}}}")
     lines.append(f"{{meta: canonical_source_repo {canonical.source_repo}}}")
@@ -1724,12 +1854,15 @@ def build_export_text(
                 "artist",
                 "subtitle",
                 "st",
+                "author",
                 "key",
                 "tempo",
                 "time",
                 "time_signature",
                 "copyright",
             }:
+                continue
+            if parse_bare_metadata_line(raw.strip()):
                 continue
             filtered.append(raw)
         lines.extend(filtered)
@@ -1783,10 +1916,12 @@ def export_results(
                 "index": song.index,
                 "title": song.title,
                 "artist": song.artist,
+                "author": song.author,
                 "source_repo": song.source_repo,
                 "source_format": song.source_format,
                 "source_path": song.source_path,
                 "file_hash": song.file_hash,
+                "source_meta": json.dumps(song.source_meta, ensure_ascii=False),
                 "has_chords": int(song.has_chords),
                 "chord_count": song.chord_count,
                 "line_count": song.line_count,
@@ -1847,10 +1982,12 @@ def export_results(
                 "canonical_reason": canonical_reason,
                 "title": canonical.title,
                 "artist": canonical.artist,
+                "author": canonical.author,
                 "source_repo": canonical.source_repo,
                 "source_format": canonical.source_format,
                 "source_path": canonical.source_path,
                 "file_hash": canonical.file_hash,
+                "source_meta": json.dumps(canonical.source_meta, ensure_ascii=False),
                 "has_chords": int(canonical.has_chords),
                 "chord_count": canonical.chord_count,
                 "line_count": canonical.line_count,
@@ -1895,10 +2032,12 @@ def export_results(
             "index",
             "title",
             "artist",
+            "author",
             "source_repo",
             "source_format",
             "source_path",
             "file_hash",
+            "source_meta",
             "has_chords",
             "chord_count",
             "line_count",
@@ -1934,10 +2073,12 @@ def export_results(
             "canonical_reason",
             "title",
             "artist",
+            "author",
             "source_repo",
             "source_format",
             "source_path",
             "file_hash",
+            "source_meta",
             "has_chords",
             "chord_count",
             "line_count",
