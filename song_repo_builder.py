@@ -25,15 +25,16 @@ import sqlite3
 import sys
 import time
 import xml.etree.ElementTree as ET
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 
-SCRIPT_VERSION = "2026.06.13.cached.1"
-PARSER_VERSION = "parser.2026.06.13.1"
-MATCHER_VERSION = "matcher.lyric_identity.2026.06.13.1"
+SCRIPT_VERSION = "2026.06.13.cached.4"
+PARSER_VERSION = "parser.2026.06.13.2"
+MATCHER_VERSION = "matcher.lyric_identity.2026.06.13.3"
 
 
 CLASS_FOLDERS = {
@@ -108,6 +109,21 @@ INLINE_CHORD_RE = re.compile(r"\[([^\[\]\n]{1,32})\]")
 METADATA_RE = re.compile(r"^\s*\{([^:{}]+)\s*:\s*(.*?)\s*\}\s*$")
 COMMENT_RE = re.compile(r"^\s*\{(?:c|comment)\s*:\s*(.*?)\s*\}\s*$", re.IGNORECASE)
 
+OPENLYRICS_STRUCTURE_NOTATION = {
+    "major": "",
+    "maj": "",
+    "min": "m",
+    "minor": "m",
+    "dom7": "7",
+    "maj7": "maj7",
+    "min7": "m7",
+    "dim": "dim",
+    "aug": "aug",
+    "sus4": "sus4",
+    "sus2": "sus2",
+    "add9": "add9",
+}
+
 
 @dataclass
 class Song:
@@ -133,6 +149,16 @@ class Song:
     chordpro_body: str = ""
     parse_status: str = "ok"
     parse_error: str = ""
+    normalized_title: str = field(init=False)
+    compact_title: str = field(init=False)
+    title_tokens: List[str] = field(init=False)
+    lyric_shingles: List[str] = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.normalized_title = normalize_title(self.title)
+        self.compact_title = compact_title(self.title)
+        self.title_tokens = title_tokens(self.title)
+        self.lyric_shingles = lyric_shingles(self.normalized_lyrics)
 
     @property
     def source_uid(self) -> str:
@@ -186,6 +212,17 @@ def now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S")
 
 
+def default_worker_count() -> int:
+    cpu_count = os.cpu_count() or 2
+    if cpu_count <= 1:
+        return 1
+    return max(1, min(8, cpu_count - 1))
+
+
+def normalized_worker_count(value: int) -> int:
+    return max(1, int(value or 1))
+
+
 def norm_space(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
 
@@ -196,7 +233,14 @@ def local_name(tag: str) -> str:
 
 def safe_read_text(path: Path) -> str:
     raw = path.read_bytes()
-    for encoding in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
+
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        try:
+            return raw.decode("utf-16")
+        except UnicodeDecodeError:
+            pass
+
+    for encoding in ("utf-8-sig", "utf-8", "utf-16", "cp1252", "latin-1"):
         try:
             return raw.decode(encoding)
         except UnicodeDecodeError:
@@ -610,6 +654,60 @@ class CacheDB:
             ),
         )
 
+    def save_pair_scores_many(
+        self,
+        entries: List[Tuple[str, str, str, Dict[str, Any]]],
+    ) -> None:
+        if not entries:
+            return
+        rows = []
+        created_at = now_iso()
+        for hash_a, hash_b, matcher_settings_hash, score in entries:
+            ha, hb = self.pair_key(hash_a, hash_b)
+            rows.append(
+                (
+                    ha,
+                    hb,
+                    MATCHER_VERSION,
+                    matcher_settings_hash,
+                    float(score["title_score"]),
+                    float(score["lyric_score"]),
+                    float(score["line_coverage_a_in_b"]),
+                    float(score["line_coverage_b_in_a"]),
+                    float(score["line_coverage_max"]),
+                    float(score["line_coverage_min"]),
+                    float(score["lyric_identity_score"]),
+                    float(score["final_score"]),
+                    int(score["shared_line_count"]),
+                    score["decision_hint"],
+                    created_at,
+                )
+            )
+        self.conn.executemany(
+            """
+            INSERT INTO pair_scores (
+                hash_a, hash_b, matcher_version, matcher_settings_hash,
+                title_score, lyric_score, line_coverage_a_in_b, line_coverage_b_in_a,
+                line_coverage_max, line_coverage_min, lyric_identity_score, final_score,
+                shared_line_count, decision_hint, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(hash_a, hash_b, matcher_version, matcher_settings_hash) DO UPDATE SET
+                title_score = excluded.title_score,
+                lyric_score = excluded.lyric_score,
+                line_coverage_a_in_b = excluded.line_coverage_a_in_b,
+                line_coverage_b_in_a = excluded.line_coverage_b_in_a,
+                line_coverage_max = excluded.line_coverage_max,
+                line_coverage_min = excluded.line_coverage_min,
+                lyric_identity_score = excluded.lyric_identity_score,
+                final_score = excluded.final_score,
+                shared_line_count = excluded.shared_line_count,
+                decision_hint = excluded.decision_hint,
+                created_at = excluded.created_at
+            """,
+            rows,
+        )
+
     def set_state(self, key: str, value: Dict[str, Any]) -> None:
         self.conn.execute(
             """
@@ -624,20 +722,75 @@ class CacheDB:
         self.conn.commit()
 
 
-def collect_text_excluding_chords(elem: ET.Element) -> str:
-    parts: List[str] = []
+@dataclass
+class OpenLyricsLine:
+    plain_parts: List[str] = field(default_factory=list)
+    chordpro_parts: List[str] = field(default_factory=list)
+
+    def append_text(self, text: Optional[str]) -> None:
+        if not text:
+            return
+        self.plain_parts.append(text)
+        self.chordpro_parts.append(text)
+
+    def append_chord(self, chord: str) -> None:
+        if chord:
+            self.chordpro_parts.append(f"[{chord}]")
+
+    @property
+    def plain(self) -> str:
+        return norm_space("".join(self.plain_parts))
+
+    @property
+    def chordpro(self) -> str:
+        return norm_space("".join(self.chordpro_parts))
+
+
+def format_openlyrics_chord_name(attributes: Dict[str, str]) -> str:
+    old_name = (attributes.get("name") or "").strip()
+    if old_name:
+        return old_name
+
+    root = (attributes.get("root") or "").strip()
+    if not root:
+        return ""
+
+    structure = (attributes.get("structure") or "").strip()
+    suffix = OPENLYRICS_STRUCTURE_NOTATION.get(structure, structure)
+    bass = (attributes.get("bass") or "").strip()
+    chord = f"{root}{suffix}"
+    return f"{chord}/{bass}" if bass else chord
+
+
+def parse_openlyrics_lines(elem: ET.Element) -> List[Tuple[str, str]]:
+    lines = [OpenLyricsLine()]
+
+    def current_line() -> OpenLyricsLine:
+        return lines[-1]
+
+    def new_line() -> None:
+        if current_line().plain or current_line().chordpro:
+            lines.append(OpenLyricsLine())
 
     def walk(node: ET.Element) -> None:
-        if node.text and local_name(node.tag) != "chord":
-            parts.append(node.text)
+        if local_name(node.tag) != "br":
+            current_line().append_text(node.text)
         for child in list(node):
-            if local_name(child.tag) != "chord":
+            tag = local_name(child.tag)
+            if tag == "br":
+                new_line()
+            elif tag == "line":
                 walk(child)
-            if child.tail:
-                parts.append(child.tail)
+                new_line()
+            elif tag == "chord":
+                current_line().append_chord(format_openlyrics_chord_name(child.attrib))
+                walk(child)
+            else:
+                walk(child)
+            current_line().append_text(child.tail)
 
     walk(elem)
-    return "".join(parts)
+    return [(line.plain, line.chordpro) for line in lines if line.plain or line.chordpro]
 
 
 def first_xml_text(root: ET.Element, names: Sequence[str]) -> str:
@@ -677,35 +830,34 @@ def parse_openlyrics(path: Path) -> Dict[str, Any]:
         verse_found = True
         name = verse.attrib.get("name") or verse.attrib.get("label") or "Verse"
         body_lines.append(f"{{comment: {name}}}")
-        verse_text_parts: List[str] = []
-        lines_elems = [child for child in verse.iter() if local_name(child.tag) in {"lines", "line"}]
+        verse_line_parts: List[Tuple[str, str]] = []
+        lines_elems = [child for child in verse if local_name(child.tag) == "lines"]
         if lines_elems:
             for line_elem in lines_elems:
-                raw = collect_text_excluding_chords(line_elem)
-                verse_text_parts.extend(raw.splitlines())
+                verse_line_parts.extend(parse_openlyrics_lines(line_elem))
         else:
-            raw = collect_text_excluding_chords(verse)
-            verse_text_parts.extend(raw.splitlines())
+            verse_line_parts.extend(parse_openlyrics_lines(verse))
 
-        for raw_line in verse_text_parts:
-            clean = norm_space(raw_line)
+        for plain_line, chorded_line in verse_line_parts:
+            clean = norm_space(plain_line)
             if not clean:
                 continue
             lines.append(clean)
-            body_lines.append(clean)
+            body_lines.append(chorded_line or clean)
         body_lines.append("")
 
     if not verse_found:
-        raw_lyrics = ""
         for elem in root.iter():
             if local_name(elem.tag) == "lyrics":
-                raw_lyrics = collect_text_excluding_chords(elem)
+                lyric_line_parts = parse_openlyrics_lines(elem)
                 break
-        for raw_line in raw_lyrics.splitlines():
-            clean = norm_space(raw_line)
+        else:
+            lyric_line_parts = []
+        for plain_line, chorded_line in lyric_line_parts:
+            clean = norm_space(plain_line)
             if clean:
                 lines.append(clean)
-                body_lines.append(clean)
+                body_lines.append(chorded_line or clean)
 
     plain_lyrics = "\n".join(lines)
     lyric_lines = meaningful_lines_from_text(plain_lyrics)
@@ -821,6 +973,11 @@ def parse_file(path: Path, source_format: str) -> Dict[str, Any]:
     return parse_plain_chordpro(path)
 
 
+def parse_file_worker(task: Tuple[int, str, str]) -> Tuple[int, Dict[str, Any]]:
+    idx, path_s, source_format = task
+    return idx, parse_file(Path(path_s), source_format)
+
+
 def discover_files(openlyrics: Optional[Path], onsong: Optional[Path], txt: Optional[Path]) -> List[Tuple[Path, str, str]]:
     discovered: List[Tuple[Path, str, str]] = []
 
@@ -885,17 +1042,40 @@ def parse_sources(
     verify_hashes: bool,
     force_reparse: bool,
     progress_every: int,
+    parse_workers: int = 1,
+    parallel_parse_threshold: int = 100,
 ) -> Tuple[List[Song], Dict[str, int]]:
-    songs: List[Song] = []
+    parse_workers = normalized_worker_count(parse_workers)
+    song_slots: List[Optional[Song]] = [None] * len(files)
+    file_info: Dict[int, Tuple[Path, str, str, str, int, int]] = {}
+    pending: List[Tuple[int, str, str]] = []
     stats = {
         "files": 0,
         "hash_cache_hits": 0,
         "hash_computed": 0,
         "parse_cache_hits": 0,
         "parsed_now": 0,
+        "parse_workers": parse_workers,
+        "parallel_parse_threshold": max(1, parallel_parse_threshold),
+        "parallel_parse_used": 0,
     }
     total = len(files)
     start = time.time()
+    done = 0
+
+    def report_progress() -> None:
+        if not progress_every or not total:
+            return
+        if done != total and done % progress_every != 0:
+            return
+        elapsed = time.time() - start
+        print(
+            f"Parsing songs: {done}/{total} elapsed {format_duration(elapsed)} "
+            f"| hash_cached={stats['hash_cache_hits']} parsed_cached={stats['parse_cache_hits']} "
+            f"parsed={stats['parsed_now']}"
+        )
+        cache.conn.commit()
+        cache.set_state("parse_progress", {"done": done, "total": total, "updated_at": now_iso()})
 
     for idx, (path, source_repo, source_format) in enumerate(files):
         st = path.stat()
@@ -914,23 +1094,59 @@ def parse_sources(
         parsed = None if force_reparse else cache.get_parsed_song(file_hash)
         if parsed:
             stats["parse_cache_hits"] += 1
-        else:
-            parsed = parse_file(path, source_format)
-            cache.save_parsed_song(file_hash, parsed)
-            stats["parsed_now"] += 1
-
-        songs.append(song_from_parsed(idx, path, source_repo, source_format, file_hash, st.st_size, st.st_mtime_ns, parsed))
-
-        if progress_every and (idx + 1 == total or (idx + 1) % progress_every == 0):
-            elapsed = time.time() - start
-            print(
-                f"Parsing songs: {idx + 1}/{total} elapsed {format_duration(elapsed)} "
-                f"| hash_cached={stats['hash_cache_hits']} parsed_cached={stats['parse_cache_hits']}"
+            song_slots[idx] = song_from_parsed(
+                idx,
+                path,
+                source_repo,
+                source_format,
+                file_hash,
+                st.st_size,
+                st.st_mtime_ns,
+                parsed,
             )
-            cache.conn.commit()
-            cache.set_state("parse_progress", {"done": idx + 1, "total": total, "updated_at": now_iso()})
+            done += 1
+            report_progress()
+        else:
+            file_info[idx] = (path, source_repo, source_format, file_hash, st.st_size, st.st_mtime_ns)
+            pending.append((idx, str(path), source_format))
+
+    use_parallel = parse_workers > 1 and len(pending) >= max(1, parallel_parse_threshold)
+
+    def save_parsed_result(idx: int, parsed: Dict[str, Any]) -> None:
+        nonlocal done
+        if song_slots[idx] is not None:
+            return
+        path, source_repo, source_format, file_hash, size, mtime_ns = file_info[idx]
+        cache.save_parsed_song(file_hash, parsed)
+        stats["parsed_now"] += 1
+        song_slots[idx] = song_from_parsed(idx, path, source_repo, source_format, file_hash, size, mtime_ns, parsed)
+        done += 1
+        report_progress()
+
+    if pending and use_parallel:
+        stats["parallel_parse_used"] = 1
+        try:
+            with ProcessPoolExecutor(max_workers=parse_workers) as executor:
+                futures = [executor.submit(parse_file_worker, task) for task in pending]
+                for future in as_completed(futures):
+                    idx, parsed = future.result()
+                    save_parsed_result(idx, parsed)
+        except Exception as exc:
+            print(f"Warning: parallel parsing failed; retrying sequentially: {exc}", file=sys.stderr)
+            stats["parallel_parse_used"] = 0
+            for task in pending:
+                idx, parsed = parse_file_worker(task)
+                save_parsed_result(idx, parsed)
+    else:
+        for task in pending:
+            idx, parsed = parse_file_worker(task)
+            save_parsed_result(idx, parsed)
 
     cache.conn.commit()
+    missing = [str(files[idx][0]) for idx, song in enumerate(song_slots) if song is None]
+    if missing:
+        raise RuntimeError(f"Parsing did not produce songs for {len(missing)} files: {missing[:3]}")
+    songs = [song for song in song_slots if song is not None]
     return songs, stats
 
 
@@ -959,14 +1175,30 @@ def line_match_score(line_a: str, line_b: str) -> float:
     return max(seq, contain, reverse_contain * 0.95)
 
 
-def line_coverage(lines_a: Sequence[str], lines_b: Sequence[str], line_match_threshold: float) -> float:
+def line_coverage(
+    lines_a: Sequence[str],
+    lines_b: Sequence[str],
+    line_match_threshold: float,
+    score_cache: Optional[Dict[Tuple[str, str], float]] = None,
+) -> float:
     if not lines_a or not lines_b:
         return 0.0
+    exact_b = set(lines_b)
     matched = 0
     for line_a in lines_a:
+        if line_a in exact_b:
+            matched += 1
+            continue
         best = 0.0
         for line_b in lines_b:
-            score = line_match_score(line_a, line_b)
+            if score_cache is not None:
+                key = (line_a, line_b)
+                score = score_cache.get(key)
+                if score is None:
+                    score = line_match_score(line_a, line_b)
+                    score_cache[key] = score
+            else:
+                score = line_match_score(line_a, line_b)
             if score > best:
                 best = score
             if best >= 1.0:
@@ -980,14 +1212,40 @@ def shared_exact_line_count(lines_a: Sequence[str], lines_b: Sequence[str]) -> i
     return len(set(lines_a) & set(lines_b))
 
 
+def exact_lyric_identity_score(a: Song, b: Song) -> Dict[str, Any]:
+    same_title = bool(
+        (a.normalized_title and a.normalized_title == b.normalized_title)
+        or (a.compact_title and a.compact_title == b.compact_title)
+    )
+    return {
+        "title_score": 1.0 if same_title else 0.0,
+        "lyric_score": 1.0,
+        "line_coverage_a_in_b": 1.0,
+        "line_coverage_b_in_a": 1.0,
+        "line_coverage_max": 1.0,
+        "line_coverage_min": 1.0,
+        "lyric_identity_score": 1.0,
+        "final_score": 1.0,
+        "shared_line_count": shared_exact_line_count(a.lyric_lines, b.lyric_lines),
+        "decision_hint": "strong_lyric_identity",
+        "score_method": "exact_normalized_lyrics",
+    }
+
+
 def score_pair_raw(a: Song, b: Song, line_match_threshold: float) -> Dict[str, Any]:
+    if a.normalized_lyrics and a.normalized_lyrics == b.normalized_lyrics:
+        return exact_lyric_identity_score(a, b)
+
+    title_a = a.normalized_title
+    title_b = b.normalized_title
     title_score = max(
-        sequence_ratio(normalize_title(a.title), normalize_title(b.title)),
-        sequence_ratio(compact_title(a.title), compact_title(b.title)),
+        sequence_ratio(title_a, title_b),
+        sequence_ratio(a.compact_title, b.compact_title),
     )
     lyric_score = sequence_ratio(a.normalized_lyrics, b.normalized_lyrics)
-    coverage_ab = line_coverage(a.lyric_lines, b.lyric_lines, line_match_threshold)
-    coverage_ba = line_coverage(b.lyric_lines, a.lyric_lines, line_match_threshold)
+    line_score_cache: Dict[Tuple[str, str], float] = {}
+    coverage_ab = line_coverage(a.lyric_lines, b.lyric_lines, line_match_threshold, line_score_cache)
+    coverage_ba = line_coverage(b.lyric_lines, a.lyric_lines, line_match_threshold, line_score_cache)
     cov_max = max(coverage_ab, coverage_ba)
     cov_min = min(coverage_ab, coverage_ba)
     shared_lines = shared_exact_line_count(a.lyric_lines, b.lyric_lines)
@@ -998,11 +1256,16 @@ def score_pair_raw(a: Song, b: Song, line_match_threshold: float) -> Dict[str, A
     else:
         identity_score = (cov_max * 0.60) + (cov_min * 0.20) + (lyric_score * 0.15) + (title_score * 0.05)
 
+    same_normalized_title = bool(title_a and title_a == title_b)
+    if same_normalized_title and meaningful_count >= 4 and cov_max >= 0.88 and lyric_score >= 0.72:
+        title_aligned_score = (cov_max * 0.70) + (lyric_score * 0.20) + (title_score * 0.10)
+        identity_score = max(identity_score, title_aligned_score)
+
     final_score = max(identity_score, (lyric_score * 0.85) + (title_score * 0.15))
 
     if identity_score >= 0.86:
         hint = "strong_lyric_identity"
-    elif normalize_title(a.title) and normalize_title(a.title) == normalize_title(b.title) and identity_score < 0.65:
+    elif same_normalized_title and identity_score < 0.65:
         hint = "same_title_different_lyrics"
     elif identity_score >= 0.65:
         hint = "possible_lyric_identity"
@@ -1068,6 +1331,30 @@ def score_pair(
     return pair_score_from_row(a.index, b.index, {**raw, "decision_hint": raw["decision_hint"]}, cache_hit=False)
 
 
+_SCORE_WORKER_SONGS: List[Song] = []
+_SCORE_WORKER_LINE_MATCH_THRESHOLD = 0.82
+
+
+def init_score_worker(songs: List[Song], line_match_threshold: float) -> None:
+    global _SCORE_WORKER_SONGS, _SCORE_WORKER_LINE_MATCH_THRESHOLD
+    _SCORE_WORKER_SONGS = songs
+    _SCORE_WORKER_LINE_MATCH_THRESHOLD = line_match_threshold
+
+
+def score_pair_worker(pair: Tuple[int, int]) -> Tuple[int, int, Dict[str, Any]]:
+    a_idx, b_idx = pair
+    raw = score_pair_raw(
+        _SCORE_WORKER_SONGS[a_idx],
+        _SCORE_WORKER_SONGS[b_idx],
+        _SCORE_WORKER_LINE_MATCH_THRESHOLD,
+    )
+    return a_idx, b_idx, raw
+
+
+def score_pair_batch_worker(pairs: List[Tuple[int, int]]) -> List[Tuple[int, int, Dict[str, Any]]]:
+    return [score_pair_worker(pair) for pair in pairs]
+
+
 def add_pair(pairs: Set[Tuple[int, int]], a: int, b: int) -> None:
     if a == b:
         return
@@ -1081,6 +1368,22 @@ def title_tokens(title: str) -> List[str]:
     return [t for t in normalize_title(title).split() if len(t) >= 3 and t not in stop]
 
 
+def lyric_shingles(normalized_lyrics: str, size: int = 5) -> List[str]:
+    tokens = [t for t in normalized_lyrics.split() if t]
+    if len(tokens) < size:
+        return []
+
+    shingles: List[str] = []
+    seen: Set[str] = set()
+    for idx in range(0, len(tokens) - size + 1):
+        shingle = " ".join(tokens[idx : idx + size])
+        if shingle in seen:
+            continue
+        seen.add(shingle)
+        shingles.append(shingle)
+    return shingles
+
+
 def generate_candidate_pairs(songs: List[Song], max_line_bucket: int, max_title_bucket: int) -> Set[Tuple[int, int]]:
     pairs: Set[Tuple[int, int]] = set()
 
@@ -1088,19 +1391,22 @@ def generate_candidate_pairs(songs: List[Song], max_line_bucket: int, max_title_
     compact_title_index: Dict[str, List[int]] = {}
     token_title_index: Dict[str, List[int]] = {}
     line_index: Dict[str, List[int]] = {}
+    lyric_shingle_index: Dict[str, List[int]] = {}
 
     for song in songs:
-        nt = normalize_title(song.title)
-        ct = compact_title(song.title)
+        nt = song.normalized_title
+        ct = song.compact_title
         if nt:
             exact_title_index.setdefault(nt, []).append(song.index)
         if ct:
             compact_title_index.setdefault(ct, []).append(song.index)
-        for tok in title_tokens(song.title):
+        for tok in song.title_tokens:
             token_title_index.setdefault(tok, []).append(song.index)
         for line in song.lyric_lines:
             if len(line) >= 10 and line not in COMMON_WEAK_LINES:
                 line_index.setdefault(line, []).append(song.index)
+        for shingle in song.lyric_shingles:
+            lyric_shingle_index.setdefault(shingle, []).append(song.index)
 
     def pair_bucket(bucket: List[int], max_bucket: int) -> None:
         if len(bucket) < 2 or len(bucket) > max_bucket:
@@ -1117,6 +1423,8 @@ def generate_candidate_pairs(songs: List[Song], max_line_bucket: int, max_title_
         pair_bucket(bucket, max_title_bucket)
     for bucket in line_index.values():
         pair_bucket(bucket, max_line_bucket)
+    for bucket in lyric_shingle_index.values():
+        pair_bucket(bucket, max_line_bucket)
 
     return pairs
 
@@ -1128,39 +1436,116 @@ def score_candidates(
     settings_hash: str,
     args: argparse.Namespace,
 ) -> Tuple[List[PairScore], Dict[str, int]]:
-    scores: List[PairScore] = []
-    stats = {"pairs": len(pairs), "score_cache_hits": 0, "scored_now": 0}
+    score_workers = normalized_worker_count(getattr(args, "score_workers", 1))
+    parallel_score_threshold = max(1, int(getattr(args, "parallel_score_threshold", 1000)))
+    score_batch_size = max(1, int(getattr(args, "score_batch_size", 250)))
+    cache_write_batch_size = max(1, int(getattr(args, "cache_write_batch_size", 500)))
+    scores_by_pair: Dict[Tuple[int, int], PairScore] = {}
+    pending: List[Tuple[int, int]] = []
+    pending_cache_writes: List[Tuple[str, str, str, Dict[str, Any]]] = []
+    stats = {
+        "pairs": len(pairs),
+        "score_cache_hits": 0,
+        "scored_now": 0,
+        "score_workers": score_workers,
+        "parallel_score_threshold": parallel_score_threshold,
+        "parallel_score_used": 0,
+        "score_batch_size": score_batch_size,
+        "score_batches_submitted": 0,
+        "cache_write_batch_size": cache_write_batch_size,
+        "score_cache_write_batches": 0,
+        "exact_lyric_fast_path": 0,
+    }
     total = len(pairs)
     start = time.time()
     sorted_pairs = sorted(pairs)
+    done = 0
 
-    for idx, (a_idx, b_idx) in enumerate(sorted_pairs, start=1):
-        ps = score_pair(
-            songs[a_idx],
-            songs[b_idx],
-            cache,
-            settings_hash,
-            args.line_match_threshold,
-            args.force_rescore,
+    def flush_score_cache_writes() -> None:
+        if not pending_cache_writes:
+            return
+        cache.save_pair_scores_many(pending_cache_writes)
+        pending_cache_writes.clear()
+        stats["score_cache_write_batches"] += 1
+
+    def report_progress() -> None:
+        if not args.progress_every or not total:
+            return
+        if done != total and done % args.progress_every != 0:
+            return
+        flush_score_cache_writes()
+        elapsed = time.time() - start
+        eta = estimate_eta(elapsed, done, total)
+        print(
+            f"Scoring pairs: {done}/{total} ({done / total * 100:5.1f}%) "
+            f"elapsed {format_duration(elapsed)} eta {eta} "
+            f"| cached={stats['score_cache_hits']} scored={stats['scored_now']}"
         )
-        scores.append(ps)
-        if ps.cache_hit:
+        cache.conn.commit()
+        cache.set_state("score_progress", {"done": done, "total": total, "updated_at": now_iso()})
+
+    for a_idx, b_idx in sorted_pairs:
+        cached = None if args.force_rescore else cache.get_pair_score(
+            songs[a_idx].file_hash,
+            songs[b_idx].file_hash,
+            settings_hash,
+        )
+        pair = tuple(sorted((a_idx, b_idx)))
+        if cached:
+            scores_by_pair[pair] = pair_score_from_row(a_idx, b_idx, cached, cache_hit=True)
             stats["score_cache_hits"] += 1
+            done += 1
+            report_progress()
         else:
-            stats["scored_now"] += 1
+            pending.append(pair)
 
-        if args.progress_every and (idx == total or idx % args.progress_every == 0):
-            elapsed = time.time() - start
-            eta = estimate_eta(elapsed, idx, total)
-            print(
-                f"Scoring pairs: {idx}/{total} ({idx / total * 100:5.1f}%) "
-                f"elapsed {format_duration(elapsed)} eta {eta} "
-                f"| cached={stats['score_cache_hits']} scored={stats['scored_now']}"
-            )
-            cache.conn.commit()
-            cache.set_state("score_progress", {"done": idx, "total": total, "updated_at": now_iso()})
+    use_parallel = score_workers > 1 and len(pending) >= parallel_score_threshold
 
+    def save_score_result(a_idx: int, b_idx: int, raw: Dict[str, Any]) -> None:
+        nonlocal done
+        pair = tuple(sorted((a_idx, b_idx)))
+        if pair in scores_by_pair:
+            return
+        a = songs[a_idx]
+        b = songs[b_idx]
+        pending_cache_writes.append((a.file_hash, b.file_hash, settings_hash, raw))
+        scores_by_pair[pair] = pair_score_from_row(a_idx, b_idx, raw, cache_hit=False)
+        stats["scored_now"] += 1
+        if raw.get("score_method") == "exact_normalized_lyrics":
+            stats["exact_lyric_fast_path"] += 1
+        if len(pending_cache_writes) >= cache_write_batch_size:
+            flush_score_cache_writes()
+        done += 1
+        report_progress()
+
+    if pending and use_parallel:
+        stats["parallel_score_used"] = 1
+        try:
+            with ProcessPoolExecutor(
+                max_workers=score_workers,
+                initializer=init_score_worker,
+                initargs=(songs, args.line_match_threshold),
+            ) as executor:
+                score_batches = batched(pending, score_batch_size)
+                stats["score_batches_submitted"] = len(score_batches)
+                futures = [executor.submit(score_pair_batch_worker, batch) for batch in score_batches]
+                for future in as_completed(futures):
+                    for a_idx, b_idx, raw in future.result():
+                        save_score_result(a_idx, b_idx, raw)
+        except Exception as exc:
+            print(f"Warning: parallel scoring failed; retrying sequentially: {exc}", file=sys.stderr)
+            stats["parallel_score_used"] = 0
+            for a_idx, b_idx in pending:
+                raw = score_pair_raw(songs[a_idx], songs[b_idx], args.line_match_threshold)
+                save_score_result(a_idx, b_idx, raw)
+    else:
+        for a_idx, b_idx in pending:
+            raw = score_pair_raw(songs[a_idx], songs[b_idx], args.line_match_threshold)
+            save_score_result(a_idx, b_idx, raw)
+
+    flush_score_cache_writes()
     cache.conn.commit()
+    scores = [scores_by_pair[pair] for pair in sorted_pairs]
     return scores, stats
 
 
@@ -1377,6 +1762,7 @@ def export_results(
     args: argparse.Namespace,
     cache_stats: Dict[str, Any],
 ) -> Dict[str, Any]:
+    export_start = time.time()
     out_dir = Path(args.out)
     reports_dir = out_dir / "reports"
     lookup = pair_lookup(scores)
@@ -1608,6 +1994,14 @@ def export_results(
         ],
     )
 
+    phase_timings = dict(cache_stats.get("phase_timings", {}))
+    phase_timings["export_seconds"] = round(time.time() - export_start, 3)
+    if "pre_export_seconds" in phase_timings:
+        phase_timings["total_seconds"] = round(
+            float(phase_timings["pre_export_seconds"]) + phase_timings["export_seconds"],
+            3,
+        )
+
     summary = {
         "script_version": SCRIPT_VERSION,
         "parser_version": PARSER_VERSION,
@@ -1618,6 +2012,7 @@ def export_results(
         "exported_count": exported_count,
         "classification_counts": class_counts,
         "cache_stats": cache_stats,
+        "phase_timings": phase_timings,
         "thresholds": {
             "auto_identity_threshold": args.auto_identity_threshold,
             "clean_lyric_threshold": args.clean_lyric_threshold,
@@ -1652,6 +2047,11 @@ def estimate_eta(elapsed: float, done: int, total: int) -> str:
         return "?"
     remaining = elapsed / done * (total - done)
     return format_duration(remaining)
+
+
+def batched(items: Sequence[Tuple[int, int]], batch_size: int) -> List[List[Tuple[int, int]]]:
+    size = max(1, int(batch_size or 1))
+    return [list(items[idx : idx + size]) for idx in range(0, len(items), size)]
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -1714,24 +2114,64 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default=50,
         help="Print and save progress every N files/pairs. Use 0 to disable progress logging.",
     )
+    parser.add_argument(
+        "--parse-workers",
+        type=int,
+        default=default_worker_count(),
+        help="Worker processes for uncached parsing. Use 1 to disable parse multiprocessing.",
+    )
+    parser.add_argument(
+        "--score-workers",
+        type=int,
+        default=default_worker_count(),
+        help="Worker processes for uncached pair scoring. Use 1 to disable score multiprocessing.",
+    )
+    parser.add_argument(
+        "--parallel-parse-threshold",
+        type=int,
+        default=100,
+        help="Minimum uncached files before parse multiprocessing is used.",
+    )
+    parser.add_argument(
+        "--parallel-score-threshold",
+        type=int,
+        default=1000,
+        help="Minimum uncached candidate pairs before score multiprocessing is used.",
+    )
+    parser.add_argument(
+        "--score-batch-size",
+        type=int,
+        default=250,
+        help="Candidate pairs per multiprocessing score task. Larger values reduce Windows process-pool overhead.",
+    )
+    parser.add_argument(
+        "--cache-write-batch-size",
+        type=int,
+        default=500,
+        help="Pair-score cache rows to buffer before each SQLite batch write.",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     start = time.time()
+    phase_timings: Dict[str, float] = {}
     out_dir = Path(args.out)
     cache_dir = Path(args.cache_dir) if args.cache_dir else out_dir / "_cache"
     cache = CacheDB(cache_dir / "song_repo_cache.sqlite")
     run_id = time.strftime("%Y%m%d_%H%M%S")
 
     try:
+        phase_start = time.time()
         files = discover_files(args.openlyrics, args.onsong, args.txt)
+        phase_timings["discovery_seconds"] = round(time.time() - phase_start, 3)
         if not files:
             print("No source files found. Check --openlyrics, --onsong, and --txt paths.", file=sys.stderr)
             return 2
 
-        print(f"Discovered {len(files)} source files.")
+        print(f"Discovered {len(files)} source files in {format_duration(phase_timings['discovery_seconds'])}.")
+        phase_start = time.time()
         songs, parse_stats = parse_sources(
             files,
             cache,
@@ -1739,25 +2179,50 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             args.verify_hashes,
             args.force_reparse,
             args.progress_every,
+            args.parse_workers,
+            args.parallel_parse_threshold,
+        )
+        phase_timings["parse_seconds"] = round(time.time() - phase_start, 3)
+        print(
+            f"Parsed {len(songs)} songs in {format_duration(phase_timings['parse_seconds'])} "
+            f"| parsed_now={parse_stats['parsed_now']} cached={parse_stats['parse_cache_hits']} "
+            f"| parallel={parse_stats['parallel_parse_used']} workers={parse_stats['parse_workers']}"
         )
 
         print("Building candidate pairs...")
+        phase_start = time.time()
         pairs = generate_candidate_pairs(songs, args.max_line_bucket, args.max_title_bucket)
-        print(f"Candidate pairs: {len(pairs)}")
+        phase_timings["candidate_seconds"] = round(time.time() - phase_start, 3)
+        print(f"Candidate pairs: {len(pairs)} built in {format_duration(phase_timings['candidate_seconds'])}")
 
         settings_hash = matcher_settings_hash(args)
+        phase_start = time.time()
         scores, score_stats = score_candidates(songs, pairs, cache, settings_hash, args)
+        phase_timings["score_seconds"] = round(time.time() - phase_start, 3)
+        print(
+            f"Scored {len(scores)} pairs in {format_duration(phase_timings['score_seconds'])} "
+            f"| scored_now={score_stats['scored_now']} cached={score_stats['score_cache_hits']} "
+            f"| exact_fast={score_stats['exact_lyric_fast_path']} "
+            f"| parallel={score_stats['parallel_score_used']} workers={score_stats['score_workers']} "
+            f"| batches={score_stats['score_batches_submitted']}"
+        )
 
         print("Building final groups...")
+        phase_start = time.time()
         groups = build_groups(songs, scores, args.auto_identity_threshold)
+        phase_timings["group_seconds"] = round(time.time() - phase_start, 3)
+        print(f"Built {len(groups)} groups in {format_duration(phase_timings['group_seconds'])}.")
 
         cache_stats = {
             "parse": parse_stats,
             "score": score_stats,
             "cache_db": str(cache.db_path),
             "matcher_settings_hash": settings_hash,
+            "phase_timings": phase_timings,
         }
+        phase_timings["pre_export_seconds"] = round(time.time() - start, 3)
         export_summary = export_results(songs, groups, scores, args, cache_stats)
+        phase_timings["total_seconds"] = round(time.time() - start, 3)
         cache.set_state(
             "last_run_summary",
             {
@@ -1768,7 +2233,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "group_count": export_summary["group_count"],
                 "exported_count": export_summary["exported_count"],
                 "classification_counts": export_summary["classification_counts"],
-                "elapsed_seconds": round(time.time() - start, 3),
+                "elapsed_seconds": phase_timings["total_seconds"],
+                "phase_timings": phase_timings,
                 "updated_at": now_iso(),
             },
         )
