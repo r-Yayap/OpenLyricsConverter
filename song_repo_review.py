@@ -80,6 +80,25 @@ def read_text(path: Path) -> str:
         return ""
 
 
+def resolve_report_path(out_dir: Path, raw_path: str) -> Path:
+    path = Path(raw_path)
+    if not raw_path:
+        return path
+    if path.is_absolute():
+        return path
+    if path.exists():
+        return path
+    if path.parts and path.parts[0].lower() == out_dir.name.lower():
+        parent_candidate = out_dir.parent / path
+        if parent_candidate.exists():
+            return parent_candidate
+        return parent_candidate
+    out_candidate = out_dir / path
+    if out_candidate.exists():
+        return out_candidate
+    return out_candidate
+
+
 def load_decision_map(out_dir: Path) -> Dict[str, Dict[str, Any]]:
     path = out_dir / DECISIONS_FILE
     try:
@@ -117,10 +136,8 @@ def load_review_candidates(out_dir: Path) -> List[ReviewCandidate]:
         class_key = row.get("classification", "")
         if class_key not in REVIEW_CLASS_KEYS:
             continue
-        export_path = Path(row.get("export_path", ""))
-        if not export_path.is_absolute():
-            export_path = out_dir / export_path
-        source_path = Path(row.get("source_path", ""))
+        export_path = resolve_report_path(out_dir, row.get("export_path", ""))
+        source_path = resolve_report_path(out_dir, row.get("source_path", ""))
         group = group_rows.get(row.get("group_id", ""), {})
         title = row.get("title", "")
         decision = decisions.get(row.get("group_id", ""))

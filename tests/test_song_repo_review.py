@@ -216,6 +216,21 @@ class ReviewCoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             self.assertEqual(review.load_review_candidates(pathlib.Path(temp_dir)), [])
 
+    def test_report_paths_that_include_output_folder_do_not_duplicate_candidates(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_dir, export_path = self.make_output(temp_dir)
+            report_path = out_dir / "reports" / "03_canonical_selection.csv"
+            with report_path.open("r", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            rows[0]["export_path"] = str(pathlib.Path(out_dir.name) / builder.CLASS_FOLDERS["needs_review"] / export_path.name)
+            write_csv(report_path, rows, rows[0].keys())
+
+            candidates = review.load_review_candidates(out_dir)
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].export_path, export_path)
+        self.assertIn("Review lyric", candidates[0].export_text)
+
 
 if __name__ == "__main__":
     unittest.main()
